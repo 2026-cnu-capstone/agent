@@ -1,0 +1,147 @@
+"""LangGraph 기반 포렌식 에이전트 그래프 정의"""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+from functools import partial
+from typing import Any
+
+import structlog
+from langgraph.graph import END, START, StateGraph
+
+from graph.state import AgentState
+from llm_provider.anthropic import AnthropicProvider
+from llm_provider.base import BaseLLMProvider, ToolResult
+from llm_provider.tool_converter import (
+    format_tool_summaries,
+    mcp_tools_to_anthropic,
+    mcp_tools_to_openai,
+)
+from mcp_client.client import MCPClientManager
+from prompts.system import build_system_prompt
+
+logger = structlog.get_logger()
+
+MAX_ITERATIONS = 20
+
+
+async def llm_node(
+    state: AgentState,
+    *,
+    llm: BaseLLMProvider,
+    mcp: MCPClientManager,
+) -> dict[str, Any]:
+    """LLM 호출을 통한 응답 또는 도구 호출 생성"""
+    tools = await mcp.list_tools()
+    if isinstance(llm, AnthropicProvider):
+        tool_params = mcp_tools_to_anthropic(tools)
+    else:
+        tool_params = mcp_tools_to_openai(tools)
+    system = build_system_prompt(format_tool_summaries(tools))
+
+    response = await llm.chat(
+        messages=state["messages"],
+        tools=tool_params if tool_params else None,
+        system=system,
+    )
+
+    assistant_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": response.content,
+    }
+
+    if response.tool_calls:
+        assistant_message["tool_calls"] = [asdict(tc) for tc in response.tool_calls]
+        return {
+            "messages": [assistant_message],
+            "pending_tool_calls": [asdict(tc) for tc in response.tool_calls],
+        }
+
+    return {
+        "messages": [assistant_message],
+        "pending_tool_calls": [],
+    }
+
+
+async def tool_node(
+    state: AgentState,
+    *,
+    llm: BaseLLMProvider,
+    mcp: MCPClientManager,
+) -> dict[str, Any]:
+    """대기 중인 도구 호출의 MCP 실행"""
+    results: list[ToolResult] = []
+
+    for tc in state["pending_tool_calls"]:
+        try:
+            call_result = await mcp.call_tool(tc["name"], tc.get("arguments"))
+            content = mcp.get_tool_result_text(call_result)
+            is_error = bool(call_result.isError)
+        except Exception as exc:
+            logger.error("tool_execution_failed", tool=tc["name"], error=str(exc))
+            content = f"Error: {exc}"
+            is_error = True
+
+        results.append(
+            ToolResult(
+                tool_call_id=tc["id"],
+                content=content,
+                is_error=is_error,
+            )
+        )
+
+    tool_results_message: dict[str, Any] = {
+        "role": "user",
+        "content": [llm.format_tool_result(r) for r in results],
+    }
+
+    return {
+        "messages": [tool_results_message],
+        "pending_tool_calls": [],
+        "iteration_count": state["iteration_count"] + 1,
+    }
+
+
+def should_continue(state: AgentState) -> str:
+    """도구 호출이 있으면 tool_node로, 없으면 종료"""
+    if state["pending_tool_calls"] and state["iteration_count"] < MAX_ITERATIONS:
+        return "tools"
+    return "end"
+
+
+def build_agent_graph(
+    llm: BaseLLMProvider,
+    mcp: MCPClientManager,
+) -> Any:
+    """포렌식 에이전트 LangGraph 구성 및 컴파일
+
+    기본 ReAct 루프:
+        START → llm → [조건부] → tools → llm → ... → END
+
+    향후 PR에서 HITL 승인 노드 삽입 예정
+    """
+    graph = StateGraph(AgentState)
+
+    graph.add_node("llm", partial(llm_node, llm=llm, mcp=mcp))
+    graph.add_node("tools", partial(tool_node, llm=llm, mcp=mcp))
+
+    graph.add_edge(START, "llm")
+    graph.add_conditional_edges(
+        "llm",
+        should_continue,
+        {"tools": "tools", "end": END},
+    )
+    graph.add_edge("tools", "llm")
+
+    return graph.compile()
+
+
+def create_initial_state(user_message: str) -> AgentState:
+    """사용자 메시지 기반 초기 에이전트 상태 생성"""
+    return AgentState(
+        messages=[{"role": "user", "content": user_message}],
+        tools={},
+        pending_tool_calls=[],
+        iteration_count=0,
+        phase="initial",
+    )
