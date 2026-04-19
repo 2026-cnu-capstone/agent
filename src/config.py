@@ -166,7 +166,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
         settings.llm.base_url = settings.llm_base_url
 
     model = settings.llm.model.lower()
-    if model.startswith(("gpt", "o1", "o3")):
+    if model.startswith(("gpt", "o1", "o3")) or settings.llm.base_url:
         settings.llm.provider = LLMProvider.OPENAI
 
     return settings

@@ -27,4 +27,7 @@ class AgentState(TypedDict):
     """현재 에이전트 루프 반복 횟수 (안전 제한용)"""
 
     phase: str
-    """현재 HITL 단계 (향후 사용)"""
+    """현재 HITL 단계 (planning | execution)"""
+
+    analysis_plan: str
+    """planning_node가 수립한 분석 계획 텍스트"""
