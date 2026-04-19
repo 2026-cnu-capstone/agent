@@ -18,11 +18,38 @@ from llm_provider.tool_converter import (
     mcp_tools_to_openai,
 )
 from mcp_client.client import MCPClientManager
-from prompts.system import build_system_prompt
+from prompts.system import build_planning_prompt, build_system_prompt
 
 logger = structlog.get_logger()
 
 MAX_ITERATIONS = 20
+
+
+async def planning_node(
+    state: AgentState,
+    *,
+    llm: BaseLLMProvider,
+) -> dict[str, Any]:
+    """사용자 사건 입력을 바탕으로 분석 계획 수립
+
+    도구 호출 없이 LLM이 계획 텍스트만 반환하도록 유도
+    수립된 계획은 state["analysis_plan"]에 저장됨
+    """
+    response = await llm.chat(
+        messages=state["messages"],
+        tools=None,
+        system=build_planning_prompt(),
+    )
+
+    plan_text = response.content if isinstance(response.content, str) else ""
+    logger.info("analysis_plan_created", length=len(plan_text))
+
+    return {
+        "messages": [{"role": "assistant", "content": response.content}],
+        "analysis_plan": plan_text,
+        "pending_tool_calls": [],
+        "phase": "execution",
+    }
 
 
 async def llm_node(
@@ -37,7 +64,7 @@ async def llm_node(
         tool_params = mcp_tools_to_anthropic(tools)
     else:
         tool_params = mcp_tools_to_openai(tools)
-    system = build_system_prompt(format_tool_summaries(tools))
+    system = build_system_prompt(format_tool_summaries(tools), state.get("analysis_plan", ""))
 
     response = await llm.chat(
         messages=state["messages"],
@@ -109,6 +136,20 @@ def should_continue(state: AgentState) -> str:
     return "end"
 
 
+def build_planning_graph(llm: BaseLLMProvider) -> Any:
+    """계획 수립 전용 그래프 (MCP 불필요)
+
+    START → planning → END
+    팀원이 사용자 입력을 수집한 뒤 이 그래프를 호출하면
+    result["analysis_plan"]에 계획 텍스트가 담겨 반환됨
+    """
+    graph = StateGraph(AgentState)
+    graph.add_node("planning", partial(planning_node, llm=llm))
+    graph.add_edge(START, "planning")
+    graph.add_edge("planning", END)
+    return graph.compile()
+
+
 def build_agent_graph(
     llm: BaseLLMProvider,
     mcp: MCPClientManager,
@@ -143,5 +184,6 @@ def create_initial_state(user_message: str) -> AgentState:
         tools={},
         pending_tool_calls=[],
         iteration_count=0,
-        phase="initial",
+        phase="planning",
+        analysis_plan="",
     )
