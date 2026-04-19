@@ -29,5 +29,8 @@ class AgentState(TypedDict):
     phase: str
     """현재 HITL 단계 (planning | execution)"""
 
+    analysis_strategy: str
+    """strategy_node가 수립한 분석 전략 텍스트"""
+
     analysis_plan: str
-    """planning_node가 수립한 분석 계획 텍스트"""
+    """planning_node가 수립한 세부 실행 계획 텍스트"""
