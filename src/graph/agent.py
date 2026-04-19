@@ -18,11 +18,38 @@ from llm_provider.tool_converter import (
     mcp_tools_to_openai,
 )
 from mcp_client.client import MCPClientManager
-from prompts.system import build_planning_prompt, build_system_prompt
+from prompts.system import build_planning_prompt, build_strategy_prompt, build_system_prompt
 
 logger = structlog.get_logger()
 
 MAX_ITERATIONS = 20
+
+
+async def strategy_node(
+    state: AgentState,
+    *,
+    llm: BaseLLMProvider,
+) -> dict[str, Any]:
+    """사용자 사건 입력을 바탕으로 분석 전략 수립
+
+    무엇을 조사할지, 어떤 방향으로 접근할지 고수준 전략 도출
+    수립된 전략은 state["analysis_strategy"]에 저장됨
+    """
+    response = await llm.chat(
+        messages=state["messages"],
+        tools=None,
+        system=build_strategy_prompt(),
+    )
+
+    strategy_text = response.content if isinstance(response.content, str) else ""
+    logger.info("analysis_strategy_created", length=len(strategy_text))
+
+    return {
+        "messages": [{"role": "assistant", "content": response.content}],
+        "analysis_strategy": strategy_text,
+        "pending_tool_calls": [],
+        "phase": "planning",
+    }
 
 
 async def planning_node(
@@ -30,15 +57,15 @@ async def planning_node(
     *,
     llm: BaseLLMProvider,
 ) -> dict[str, Any]:
-    """사용자 사건 입력을 바탕으로 분석 계획 수립
+    """수립된 전략을 바탕으로 세부 실행 계획 수립
 
-    도구 호출 없이 LLM이 계획 텍스트만 반환하도록 유도
+    strategy_node의 결과를 입력으로 받아 단계별 실행 계획 생성
     수립된 계획은 state["analysis_plan"]에 저장됨
     """
     response = await llm.chat(
         messages=state["messages"],
         tools=None,
-        system=build_planning_prompt(),
+        system=build_planning_prompt(state.get("analysis_strategy", "")),
     )
 
     plan_text = response.content if isinstance(response.content, str) else ""
@@ -136,11 +163,24 @@ def should_continue(state: AgentState) -> str:
     return "end"
 
 
+def build_strategy_graph(llm: BaseLLMProvider) -> Any:
+    """전략 수립 전용 그래프 (MCP 불필요)
+
+    START → strategy → END
+    result["analysis_strategy"]에 전략 텍스트가 담겨 반환됨
+    """
+    graph = StateGraph(AgentState)
+    graph.add_node("strategy", partial(strategy_node, llm=llm))
+    graph.add_edge(START, "strategy")
+    graph.add_edge("strategy", END)
+    return graph.compile()
+
+
 def build_planning_graph(llm: BaseLLMProvider) -> Any:
     """계획 수립 전용 그래프 (MCP 불필요)
 
     START → planning → END
-    팀원이 사용자 입력을 수집한 뒤 이 그래프를 호출하면
+    state["analysis_strategy"]를 바탕으로 세부 계획 생성
     result["analysis_plan"]에 계획 텍스트가 담겨 반환됨
     """
     graph = StateGraph(AgentState)
@@ -184,6 +224,20 @@ def create_initial_state(user_message: str) -> AgentState:
         tools={},
         pending_tool_calls=[],
         iteration_count=0,
+        phase="strategy",
+        analysis_strategy="",
+        analysis_plan="",
+    )
+
+
+def create_planning_state(user_message: str, strategy: str) -> AgentState:
+    """전략이 확정된 후 계획 수립용 상태 생성"""
+    return AgentState(
+        messages=[{"role": "user", "content": user_message}],
+        tools={},
+        pending_tool_calls=[],
+        iteration_count=0,
         phase="planning",
+        analysis_strategy=strategy,
         analysis_plan="",
     )
