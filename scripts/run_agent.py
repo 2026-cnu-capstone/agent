@@ -2,19 +2,43 @@
 
 Usage:
     uv run python scripts/run_agent.py
+    uv run python scripts/run_agent.py --verbose
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
+import structlog
+
 from config import LLMProvider, load_settings
+from database.engine import get_engine, init_db
+from disk_image_validator import validate_image_path
 from graph.agent import build_agent_graph, create_initial_state
 from llm_provider.anthropic import AnthropicProvider
 from llm_provider.openai import OpenAIProvider
 from mcp_client.client import MCPClientManager
+
+
+def configure_logging(verbose: bool) -> None:
+    """로그 출력 레벨 설정
+
+    Args:
+        verbose: True면 전체 로그 출력, False면 WARNING 이상만 출력
+    """
+    level = logging.DEBUG if verbose else logging.WARNING
+
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(level),
+    )
+
+    logging.basicConfig(level=level, stream=sys.stderr)
+    logging.getLogger("dissect").setLevel(level)
+    logging.getLogger("mcp").setLevel(level)
 
 
 async def async_input(prompt: str) -> str:
@@ -32,7 +56,7 @@ async def async_input(prompt: str) -> str:
     """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
-        None, lambda: sys.stdin.buffer.readline().decode("utf-8").strip()
+        None, lambda: sys.stdin.readline().strip()
     )
 
 
@@ -50,15 +74,17 @@ def create_llm_provider(settings):
     return AnthropicProvider(settings.llm, api_key=settings.llm_api_key)
 
 
-def print_tools(tools):
+def print_tools(tools, verbose: bool = False):
     """발견된 MCP 도구 목록을 출력
 
     Args:
         tools: 도구 이름을 키로, Tool 객체를 값으로 갖는 딕셔너리
+        verbose: 상세 출력 여부
     """
-    print(f"[MCP] 발견된 도구 {len(tools)}개:")
-    for name, tool in tools.items():
-        print(f"  - {name}: {tool.description or '(설명 없음)'}")
+    print(f"[MCP] 발견된 도구 {len(tools)}개")
+    if verbose:
+        for name, tool in tools.items():
+            print(f"  - {name}: {tool.description or '(설명 없음)'}")
 
     if not tools:
         print("[Warning] 사용 가능한 도구가 없습니다.")
@@ -79,8 +105,54 @@ def extract_last_assistant_message(messages):
     return None
 
 
+async def prompt_disk_image_path() -> tuple[str, str] | None:
+    """디스크 이미지 경로를 사용자로부터 입력받아 검증
+
+    경로가 유효할 때까지 반복 질의하며,
+    quit 입력 시 None을 반환하여 종료 신호 전달
+
+    Returns:
+        (검증된 경로, 형식) 튜플 또는 None (종료 시)
+    """
+    print("분석할 디스크 이미지 경로를 입력하세요. (지원 형식: E01, dd, raw)\n")
+
+    while True:
+        sys.stdout.write("Image path: ")
+        sys.stdout.flush()
+        path_input = await async_input("")
+        if not path_input or path_input.lower() in ("quit", "exit", "q"):
+            return None
+
+        result = validate_image_path(path_input)
+        if result.is_valid:
+            assert result.format is not None
+            cleaned_path = path_input.strip("'\"")
+            return cleaned_path, result.format.value
+
+        print(f"[Error] {result.error_message}")
+        print("다시 입력해주세요.\n")
+
+
+def parse_args() -> argparse.Namespace:
+    """커맨드라인 인자 파싱
+
+    Returns:
+        파싱된 인자
+    """
+    parser = argparse.ArgumentParser(description="포렌식 에이전트 실행")
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="시스템 로그 메시지 출력 (기본: 숨김)",
+    )
+    return parser.parse_args()
+
+
 async def main() -> None:
     """에이전트 초기화 및 대화형 루프 실행"""
+    args = parse_args()
+    configure_logging(args.verbose)
+
     config_path = Path(__file__).parent.parent / "config" / "mcp_servers.json"
     settings = load_settings(config_path)
 
@@ -91,16 +163,32 @@ async def main() -> None:
         print("[Error] LLM_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.")
         return
 
+    if not settings.database_url:
+        print("[Error] DATABASE_URL이 설정되지 않았습니다. .env 파일을 확인하세요.")
+        return
+
+    db_engine = get_engine(settings.database_url)
+    await init_db(db_engine)
+    print("[DB] 데이터베이스 연결 및 테이블 초기화 완료")
+
     llm = create_llm_provider(settings)
 
     async with MCPClientManager(settings.mcp) as mcp:
         tools = await mcp.list_tools()
-        print_tools(tools)
+        print_tools(tools, verbose=args.verbose)
 
-        graph = build_agent_graph(llm, mcp)
+        graph = build_agent_graph(llm, mcp, db_engine)
 
         print("\n===== Forensic Agent =====")
-        print("디스크 이미지 분석 요청을 입력하세요. (quit으로 종료)\n")
+
+        image_result = await prompt_disk_image_path()
+        if image_result is None:
+            print("종료합니다.")
+            return
+
+        image_path, image_format = image_result
+        print(f"\n[Image] {image_path} (형식: {image_format.upper()}) 등록 완료")
+        print("사건 개요를 입력하세요. (quit으로 종료)\n")
 
         while True:
             sys.stdout.write("You: ")
@@ -110,7 +198,11 @@ async def main() -> None:
                 print("종료합니다.")
                 break
 
-            state = create_initial_state(user_input)
+            state = create_initial_state(
+                user_message=user_input,
+                disk_image_path=image_path,
+                disk_image_format=image_format,
+            )
             try:
                 result = await graph.ainvoke(state)
                 reply = extract_last_assistant_message(result["messages"])
@@ -118,6 +210,8 @@ async def main() -> None:
                     print(f"\nAgent: {reply}\n")
             except Exception as e:
                 print(f"\n[Error] {e}\n")
+
+    await db_engine.dispose()
 
 
 if __name__ == "__main__":
