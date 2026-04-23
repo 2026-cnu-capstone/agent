@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "dissect": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/dissect-mcp", "dissect-mcp"]
+    },
+    "remote_plaso": {
+      "transport": "sse",
+      "url": "http://localhost:8080/sse"
+    }
+  }
+}
