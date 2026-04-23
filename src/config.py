@@ -74,9 +74,10 @@ class Settings(BaseSettings):
     """애플리케이션 전체 설정
 
     환경변수 매핑:
-        LLM_API_KEY  → llm_api_key
-        LLM_MODEL    → llm.model (load_settings에서 처리)
-        LLM_BASE_URL → llm.base_url (load_settings에서 처리)
+        LLM_API_KEY    → llm_api_key
+        LLM_MODEL      → llm.model (load_settings에서 처리)
+        LLM_BASE_URL   → llm.base_url (load_settings에서 처리)
+        DATABASE_URL   → database_url
     """
 
     model_config = SettingsConfigDict(
@@ -91,6 +92,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = ""
     llm_base_url: str = ""
+    database_url: str = ""
 
 
 def _load_mcp_from_json(path: Path) -> MCPConfig:

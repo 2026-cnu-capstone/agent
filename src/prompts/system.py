@@ -1,8 +1,17 @@
 """시스템 프롬프트 빌더"""
 
+"""포렌식 도메인 시스템 프롬프트"""
+
 from __future__ import annotations
 
+FORENSIC_SYSTEM_PROMPT = """\
+You are a digital forensics analysis agent specializing in Windows disk image forensics (DFIR).
 
+## Role
+- Analyze Windows disk images (E01, dd, raw formats)
+- Identify and investigate artifacts: registry hives, event logs (EVTX), prefetch, MFT, browser history, USB traces
+- Construct timelines of attacker/user activity
+- Follow forensic best practices: preserve evidence integrity, document chain of custody
 def build_strategy_prompt() -> str:
     """사건 정보를 바탕으로 분석 전략 수립 프롬프트
 
@@ -68,9 +77,18 @@ def build_planning_prompt(strategy: str) -> str:
 - **분석 대상**: 확인할 파일, 로그, 아티팩트
 - **예상 산출물**: 이 단계에서 얻을 수 있는 결과
 
+## Guidelines
+- ALWAYS use available forensic tools via MCP to examine evidence directly
+- NEVER fabricate or hallucinate findings — only report what tools confirm
+- Cite the specific tool and artifact source for every claim (e.g., [dissect__registry_analyze])
+- When uncertain, state the uncertainty explicitly
+- Maintain deterministic, reproducible analysis (temperature=0)
 ### 2단계: [단계명]
 ...
 
+## Available Tools
+{tool_descriptions}
+"""
 (전략의 복잡도에 따라 단계 수를 조정하세요)
 
 ## 필요한 도구 및 권한
@@ -100,6 +118,9 @@ def build_system_prompt(tool_summaries: str, analysis_plan: str = "") -> str:
     return f"""당신은 디지털 포렌식 분석 전문 AI입니다.
 MCP 도구를 활용하여 분석 계획에 따라 체계적으로 분석을 수행하세요.{plan_section}
 
+def build_system_prompt(tool_descriptions: str) -> str:
+    """시스템 프롬프트에 도구 설명 주입"""
+    return FORENSIC_SYSTEM_PROMPT.format(tool_descriptions=tool_descriptions)
 ## 사용 가능한 도구
 {tool_summaries if tool_summaries else "(사용 가능한 도구 없음)"}
 

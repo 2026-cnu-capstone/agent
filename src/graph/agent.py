@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
 from functools import partial
 from typing import Any
 
 import structlog
 from langgraph.graph import END, START, StateGraph
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from database.engine import get_session
+from database.repository import create_case
 from graph.state import AgentState
 from llm_provider.anthropic import AnthropicProvider
 from llm_provider.base import BaseLLMProvider, ToolResult
@@ -79,6 +83,36 @@ async def planning_node(
     }
 
 
+def _serialize_tool_calls(
+    tool_calls: list[Any], llm: BaseLLMProvider
+) -> list[dict[str, Any]]:
+    """프로바이더별 tool_calls 메시지 직렬화
+
+    OpenAI는 type/function 중첩 구조, Anthropic은 플랫 구조
+
+    Args:
+        tool_calls: ToolCall 객체 목록
+        llm: LLM 프로바이더 인스턴스
+
+    Returns:
+        직렬화된 tool_calls 목록
+    """
+    if isinstance(llm, AnthropicProvider):
+        return [asdict(tc) for tc in tool_calls]
+
+    return [
+        {
+            "id": tc.id,
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": json.dumps(tc.arguments),
+            },
+        }
+        for tc in tool_calls
+    ]
+
+
 async def llm_node(
     state: AgentState,
     *,
@@ -105,7 +139,8 @@ async def llm_node(
     }
 
     if response.tool_calls:
-        assistant_message["tool_calls"] = [asdict(tc) for tc in response.tool_calls]
+        serialized = _serialize_tool_calls(response.tool_calls, llm)
+        assistant_message["tool_calls"] = serialized
         return {
             "messages": [assistant_message],
             "pending_tool_calls": [asdict(tc) for tc in response.tool_calls],
@@ -144,16 +179,100 @@ async def tool_node(
             )
         )
 
-    tool_results_message: dict[str, Any] = {
-        "role": "user",
-        "content": [llm.format_tool_result(r) for r in results],
-    }
+    if isinstance(llm, AnthropicProvider):
+        tool_messages: list[dict[str, Any]] = [
+            {
+                "role": "user",
+                "content": [llm.format_tool_result(r) for r in results],
+            }
+        ]
+    else:
+        tool_messages = [llm.format_tool_result(r) for r in results]
 
     return {
-        "messages": [tool_results_message],
+        "messages": tool_messages,
         "pending_tool_calls": [],
         "iteration_count": state["iteration_count"] + 1,
     }
+
+
+async def intake_node(
+    state: AgentState,
+    *,
+    db_engine: AsyncEngine,
+) -> dict[str, Any]:
+    """사건 정보 수신 및 디스크 이미지 등록
+
+    state에 사전 설정된 디스크 이미지 경로와 사용자 프롬프트를
+    DB에 저장하고 분석 단계로 전환
+
+    Args:
+        state: 현재 에이전트 상태
+        db_engine: SQLAlchemy 비동기 엔진
+
+    Returns:
+        상태 업데이트 딕셔너리
+    """
+    last_message = state["messages"][-1]
+    user_text = last_message.get("content", "")
+    image_path = state.get("disk_image_path") or ""
+    fmt = state.get("disk_image_format") or ""
+
+    if not image_path or not fmt:
+        logger.warning("no_image_path_in_state")
+        return {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "디스크 이미지 경로가 설정되지 않았습니다.",
+                }
+            ],
+        }
+
+    async with get_session(db_engine) as session:
+        case = await create_case(
+            session=session,
+            user_prompt=user_text,
+            disk_image_path=image_path,
+            disk_image_format=fmt,
+        )
+        case_id = case.id
+
+    logger.info(
+        "case_created",
+        case_id=case_id,
+        image_path=image_path,
+        image_format=fmt,
+    )
+
+    return {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": f"케이스가 등록되었습니다 (ID: {case_id}). "
+                f"디스크 이미지: {image_path} (형식: {fmt.upper()}). "
+                f"분석을 시작합니다.",
+            }
+        ],
+        "case_id": case_id,
+        "phase": "analysis",
+    }
+
+
+def intake_router(state: AgentState) -> str:
+    """intake 단계 라우팅
+
+    디스크 이미지 검증 성공 시 분석 단계로, 실패 시 종료(사용자 재입력 대기)
+
+    Args:
+        state: 현재 에이전트 상태
+
+    Returns:
+        다음 노드 이름 ("llm" 또는 "end")
+    """
+    if state.get("phase") == "analysis" and state.get("case_id") is not None:
+        return "llm"
+    return "end"
 
 
 def should_continue(state: AgentState) -> str:
@@ -193,20 +312,32 @@ def build_planning_graph(llm: BaseLLMProvider) -> Any:
 def build_agent_graph(
     llm: BaseLLMProvider,
     mcp: MCPClientManager,
+    db_engine: AsyncEngine,
 ) -> Any:
     """포렌식 에이전트 LangGraph 구성 및 컴파일
 
-    기본 ReAct 루프:
-        START → llm → [조건부] → tools → llm → ... → END
+    그래프 토폴로지:
+        START → intake → [intake_router] → END (검증 실패)
+                                         → llm (검증 성공)
+        llm → [should_continue] → tools → llm → ... → END
 
-    향후 PR에서 HITL 승인 노드 삽입 예정
+    Args:
+        llm: LLM 프로바이더 인스턴스
+        mcp: MCP 클라이언트 매니저
+        db_engine: SQLAlchemy 비동기 엔진
     """
     graph = StateGraph(AgentState)
 
+    graph.add_node("intake", partial(intake_node, db_engine=db_engine))
     graph.add_node("llm", partial(llm_node, llm=llm, mcp=mcp))
     graph.add_node("tools", partial(tool_node, llm=llm, mcp=mcp))
 
-    graph.add_edge(START, "llm")
+    graph.add_edge(START, "intake")
+    graph.add_conditional_edges(
+        "intake",
+        intake_router,
+        {"llm": "llm", "end": END},
+    )
     graph.add_conditional_edges(
         "llm",
         should_continue,
@@ -217,13 +348,30 @@ def build_agent_graph(
     return graph.compile()
 
 
-def create_initial_state(user_message: str) -> AgentState:
-    """사용자 메시지 기반 초기 에이전트 상태 생성"""
+def create_initial_state(
+    user_message: str,
+    disk_image_path: str | None = None,
+    disk_image_format: str | None = None,
+) -> AgentState:
+    """사용자 메시지 기반 초기 에이전트 상태 생성
+
+    Args:
+        user_message: 사용자 입력 메시지
+        disk_image_path: 사전 검증된 디스크 이미지 경로
+        disk_image_format: 디스크 이미지 형식 (e01, dd, raw)
+
+    Returns:
+        초기 에이전트 상태
+    """
     return AgentState(
         messages=[{"role": "user", "content": user_message}],
         tools={},
         pending_tool_calls=[],
         iteration_count=0,
+        phase="intake",
+        case_id=None,
+        disk_image_path=disk_image_path,
+        disk_image_format=disk_image_format,
         phase="strategy",
         analysis_strategy="",
         analysis_plan="",
