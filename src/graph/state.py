@@ -27,4 +27,13 @@ class AgentState(TypedDict):
     """현재 에이전트 루프 반복 횟수 (안전 제한용)"""
 
     phase: str
-    """현재 HITL 단계 (향후 사용)"""
+    """현재 HITL 단계 (intake, analysis 등)"""
+
+    case_id: int | None
+    """DB에 저장된 케이스 ID"""
+
+    disk_image_path: str | None
+    """검증된 디스크 이미지 파일 경로"""
+
+    disk_image_format: str | None
+    """검증된 디스크 이미지 형식 (e01, dd, raw)"""
