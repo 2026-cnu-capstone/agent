@@ -1,6 +1,4 @@
-"""시스템 프롬프트 빌더"""
-
-"""포렌식 도메인 시스템 프롬프트"""
+"""시스템 프롬프트 빌더 (포렌식 도메인)"""
 
 from __future__ import annotations
 
@@ -12,94 +10,142 @@ You are a digital forensics analysis agent specializing in Windows disk image fo
 - Identify and investigate artifacts: registry hives, event logs (EVTX), prefetch, MFT, browser history, USB traces
 - Construct timelines of attacker/user activity
 - Follow forensic best practices: preserve evidence integrity, document chain of custody
+"""
 def build_strategy_prompt() -> str:
-    """사건 정보를 바탕으로 분석 전략 수립 프롬프트
+    """사건 정보를 바탕으로 조사할 아티팩트 목록만 간단히 도출
 
-    무엇을 조사할지, 어떤 방향으로 접근할지 고수준 전략만 도출
+    세부 계획 없이, 어떤 아티팩트를 조사할지 항목 형태로만 출력.
     """
     return """당신은 디지털 포렌식 분석 전문가 AI입니다.
 
-사용자가 제공한 사건 정보를 바탕으로 분석 전략을 수립하세요.
-세부 실행 계획이 아닌, 전체적인 조사 방향과 접근 전략을 작성합니다.
-아래 형식을 반드시 따르세요.
+사용자가 제공한 사건 정보를 바탕으로, 이 사건에서 조사해야 할 아티팩트 목록만 작성하세요.
+설명이나 분석 방법은 쓰지 말고, 아티팩트 이름과 조사 이유를 한 줄씩 나열하세요.
 
----
+출력 형식 (이 형식만 사용):
 
-## 사건 개요
-사건의 핵심 내용을 2~3문장으로 요약합니다.
+## 조사 대상 아티팩트
+- [아티팩트명]: [조사 이유 한 줄]
+- [아티팩트명]: [조사 이유 한 줄]
+...
 
-## 핵심 조사 목표
-이 사건에서 반드시 규명해야 할 핵심 질문 3~5가지를 나열합니다.
+예시:
+- Registry (NTUSER.DAT): 사용자 최근 실행 파일 및 USB 연결 흔적 확인
+- Event Log (Security.evtx): 로그인/로그오프 및 계정 변경 이력 확인
+- Prefetch: 실행된 프로그램 목록 및 실행 시각 확인
+- MFT: 파일 생성·삭제·수정 타임라인 재구성
+- Browser History: 방문 URL 및 다운로드 파일 확인
 
-## 분석 전략
-어떤 영역을 중심으로 조사할지 방향을 제시합니다.
-- **우선 조사 영역**: 가장 먼저 집중해야 할 영역
-- **접근 방식**: 어떤 방법론으로 분석할지
-- **예상 침해 범위**: 사건이 영향을 미쳤을 것으로 예상되는 시스템/데이터
-
-## 주요 가설
-현재 사건 정보를 바탕으로 세울 수 있는 가설들을 나열합니다.
-
-## 주의사항
-분석 시 특별히 고려해야 할 법적/기술적 제약사항을 명시합니다.
-
----
-
-전략은 간결하고 명확하게 작성하고, 증거 보전 원칙을 우선시하세요."""
+사건과 관련된 아티팩트만 선별하고, 불필요한 항목은 포함하지 마세요."""
 
 
-def build_planning_prompt(strategy: str) -> str:
+def build_planning_prompt(strategy: str, tool_summaries: str = "") -> str:
     """수립된 전략을 바탕으로 세부 실행 계획 수립 프롬프트
 
     Args:
         strategy: strategy_node가 수립한 분석 전략 텍스트
+        tool_summaries: 사용 가능한 MCP 도구 요약 문자열
     """
     return f"""당신은 디지털 포렌식 분석 전문가 AI입니다.
 
-아래 분석 전략을 바탕으로 구체적인 단계별 실행 계획을 작성하세요.
-각 단계는 실제로 수행할 수 있는 구체적인 작업으로 구성해야 합니다.
+아래 조사 대상 아티팩트 목록을 바탕으로 단계별 실행 계획을 작성하세요.
+각 단계마다 어떤 MCP 도구를 사용할지 반드시 명시하세요.
 
-[분석 전략]
+[조사 대상 아티팩트]
 {strategy}
+
+[사용 가능한 MCP 도구]
+{tool_summaries if tool_summaries else "(연결된 도구 없음 - 도구 없이 수동 분석 계획 작성)"}
 
 ---
 
-위 전략을 실행하기 위한 세부 계획을 아래 형식으로 작성하세요.
-
-## 실행 계획 요약
-전략을 실행하기 위한 전체 흐름을 2~3문장으로 요약합니다.
+아래 형식으로 작성하세요. 각 단계는 하나의 아티팩트 또는 연관 아티팩트 묶음에 대응합니다.
 
 ## 단계별 실행 계획
 
-### 1단계: [단계명]
-- **목적**: 이 단계에서 수행할 내용
-- **구체적 작업**: 실제로 실행할 명령/도구/절차
-- **분석 대상**: 확인할 파일, 로그, 아티팩트
-- **예상 산출물**: 이 단계에서 얻을 수 있는 결과
+| 단계 | 분석 대상 | 목적 | 사용 MCP 도구 |
+|------|----------|------|--------------|
+| 1 | [아티팩트명] | [확인할 내용] | [도구명 또는 없음] |
+| 2 | ... | ... | ... |
 
-## Guidelines
-- ALWAYS use available forensic tools via MCP to examine evidence directly
-- NEVER fabricate or hallucinate findings — only report what tools confirm
-- Cite the specific tool and artifact source for every claim (e.g., [dissect__registry_analyze])
-- When uncertain, state the uncertainty explicitly
-- Maintain deterministic, reproducible analysis (temperature=0)
-### 2단계: [단계명]
-...
+## 단계별 상세
 
-## Available Tools
-{tool_descriptions}
-"""
-(전략의 복잡도에 따라 단계 수를 조정하세요)
+### 1단계: [아티팩트명]
+- **목적**: 무엇을 확인하는가
+- **MCP 도구**: [도구명] — [이 도구를 쓰는 이유]
+- **주요 확인 항목**: 구체적으로 볼 값/경로/키
 
-## 필요한 도구 및 권한
-각 단계 수행에 필요한 포렌식 도구와 시스템 접근 권한을 명시합니다.
-
-## 예상 타임라인
-각 단계의 예상 소요 시간과 전체 분석 기간을 제시합니다.
+### 2단계: ...
 
 ---
 
-계획은 전략의 우선순위를 반영하고, 법적 증거 능력이 유지되도록 작성하세요."""
+도구가 없는 단계는 MCP 도구란에 "(없음 - 수동)"으로 표기하세요."""
+
+
+def build_summary_prompt(step_results: list[dict]) -> str:
+    """에이전트 분석 결과 요약용 시스템 프롬프트
+
+    step_results의 단계별 출력을 텍스트로 나열하고,
+    LLM이 핵심 발견사항만 간략하게 요약하도록 지시.
+
+    Args:
+        step_results: 각 분석 회차 결과 목록 [{step, name, tool, output}, ...]
+    """
+    results_text = "\n\n".join(
+        f"[{r.get('step', i + 1)}단계 {r.get('name', '')}]\n{r.get('output', '')}"
+        for i, r in enumerate(step_results)
+    )
+    return f"""당신은 디지털 포렌식 분석 전문가입니다.
+아래 분석 결과를 바탕으로 핵심 발견사항을 간략하게 요약하세요.
+
+## 분석 결과
+{results_text}
+
+## 요약 지침
+- 핵심 발견사항 위주로 3~5문장 이내로 요약
+- 의심스러운 행위, 타임라인, 침해 범위를 중심으로 작성
+- 불확실한 사항은 '추정' 또는 '가능성'으로 명시"""
+
+
+def build_report_prompt(
+    case_description: str,
+    strategy: str,
+    step_results: list[dict],
+) -> str:
+    """포렌식 분석 보고서 생성용 시스템 프롬프트
+
+    사건 설명, 분석 전략, 전체 단계별 결과를 포함한 컨텍스트를 구성하고
+    LLM이 정식 포렌식 보고서 형식으로 작성하도록 지시.
+
+    Args:
+        case_description: 사용자가 입력한 사건 개요 텍스트
+        strategy: HITL에서 확정된 분석 전략 텍스트
+        step_results: 각 분석 회차 결과 목록 [{step, name, tool, output}, ...]
+    """
+    results_text = "\n\n".join(
+        f"[{r.get('step', i + 1)}단계 {r.get('name', '')}]\n{r.get('output', '')}"
+        for i, r in enumerate(step_results)
+    )
+    return f"""당신은 디지털 포렌식 분석 전문가입니다.
+아래 정보를 바탕으로 공식 포렌식 분석 보고서를 작성하세요.
+
+## 사건 개요
+{case_description}
+
+## 분석 전략
+{strategy}
+
+## 분석 결과
+{results_text}
+
+## 보고서 형식
+1. 사건 개요 요약
+2. 분석 방법론
+3. 핵심 발견사항
+4. 타임라인 재구성 (가능한 경우)
+5. 결론 및 권고사항
+6. 한계 및 주의사항
+
+법적 증거 능력이 유지되도록 객관적 사실과 추론을 명확히 구분하여 작성하세요."""
 
 
 def build_system_prompt(tool_summaries: str, analysis_plan: str = "") -> str:
@@ -118,9 +164,6 @@ def build_system_prompt(tool_summaries: str, analysis_plan: str = "") -> str:
     return f"""당신은 디지털 포렌식 분석 전문 AI입니다.
 MCP 도구를 활용하여 분석 계획에 따라 체계적으로 분석을 수행하세요.{plan_section}
 
-def build_system_prompt(tool_descriptions: str) -> str:
-    """시스템 프롬프트에 도구 설명 주입"""
-    return FORENSIC_SYSTEM_PROMPT.format(tool_descriptions=tool_descriptions)
 ## 사용 가능한 도구
 {tool_summaries if tool_summaries else "(사용 가능한 도구 없음)"}
 
