@@ -27,7 +27,7 @@ class AgentState(TypedDict):
     """현재 에이전트 루프 반복 횟수 (안전 제한용)"""
 
     phase: str
-    """현재 HITL 단계 (intake, analysis 등)"""
+    """현재 단계 (strategy | planning | intake | analysis | done)"""
 
     case_id: int | None
     """DB에 저장된 케이스 ID"""
@@ -37,10 +37,18 @@ class AgentState(TypedDict):
 
     disk_image_format: str | None
     """검증된 디스크 이미지 형식 (e01, dd, raw)"""
-    """현재 HITL 단계 (planning | execution)"""
 
     analysis_strategy: str
     """strategy_node가 수립한 분석 전략 텍스트"""
 
     analysis_plan: str
     """planning_node가 수립한 세부 실행 계획 텍스트"""
+
+    plan_steps: list[dict[str, Any]]
+    """파싱된 실행 단계 목록 [{index, name, tool, purpose, input_hint}, ...]"""
+
+    current_step_index: int
+    """현재 실행 중인 단계 인덱스"""
+
+    step_results: list[dict[str, Any]]
+    """각 단계 실행 결과 [{step, name, tool, output}, ...]"""

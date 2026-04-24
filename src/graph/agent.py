@@ -69,7 +69,10 @@ async def planning_node(
     response = await llm.chat(
         messages=state["messages"],
         tools=None,
-        system=build_planning_prompt(state.get("analysis_strategy", "")),
+        system=build_planning_prompt(
+            state.get("analysis_strategy", ""),
+            format_tool_summaries(state.get("tools") or {}),
+        ),
     )
 
     plan_text = response.content if isinstance(response.content, str) else ""
@@ -352,6 +355,7 @@ def create_initial_state(
     user_message: str,
     disk_image_path: str | None = None,
     disk_image_format: str | None = None,
+    analysis_plan: str = "",
 ) -> AgentState:
     """사용자 메시지 기반 초기 에이전트 상태 생성
 
@@ -359,9 +363,7 @@ def create_initial_state(
         user_message: 사용자 입력 메시지
         disk_image_path: 사전 검증된 디스크 이미지 경로
         disk_image_format: 디스크 이미지 형식 (e01, dd, raw)
-
-    Returns:
-        초기 에이전트 상태
+        analysis_plan: 확정된 분석 계획 텍스트 (실행 단계에서 시스템 프롬프트에 주입)
     """
     return AgentState(
         messages=[{"role": "user", "content": user_message}],
@@ -372,20 +374,32 @@ def create_initial_state(
         case_id=None,
         disk_image_path=disk_image_path,
         disk_image_format=disk_image_format,
-        phase="strategy",
         analysis_strategy="",
-        analysis_plan="",
+        analysis_plan=analysis_plan,
+        plan_steps=[],
+        current_step_index=0,
+        step_results=[],
     )
 
 
-def create_planning_state(user_message: str, strategy: str) -> AgentState:
+def create_planning_state(
+    user_message: str,
+    strategy: str,
+    tools: dict | None = None,
+) -> AgentState:
     """전략이 확정된 후 계획 수립용 상태 생성"""
     return AgentState(
         messages=[{"role": "user", "content": user_message}],
-        tools={},
+        tools=tools or {},
         pending_tool_calls=[],
         iteration_count=0,
         phase="planning",
+        case_id=None,
+        disk_image_path=None,
+        disk_image_format=None,
         analysis_strategy=strategy,
         analysis_plan="",
+        plan_steps=[],
+        current_step_index=0,
+        step_results=[],
     )
