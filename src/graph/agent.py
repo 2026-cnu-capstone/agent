@@ -454,6 +454,76 @@ def _extract_json_from_text(text: str) -> dict[str, Any]:
     return {}
 
 
+async def prepare_arguments_with_llm(
+    tool_key: str,
+    step: dict,
+    previous_steps: list[dict],
+    previous_results: list[dict],
+    llm: BaseLLMProvider,
+    mcp: MCPClientManager,
+    disk_image_path: str = "",
+    max_retries: int = 2,
+) -> dict[str, Any]:
+    """이전 도구의 Raw 출력에서 다음 도구 입력 인자를 LLM으로 추출
+
+    흐름:
+        1. Extraction  — 이전 단계 Raw 출력 텍스트 준비
+        2. Reasoning   — LLM이 inputSchema 기반으로 파라미터 추출
+        3. Validation  — required 필드 충족 여부 검증
+        4. 검증 실패 시 오류 메시지와 함께 재시도 (최대 max_retries회)
+
+    Args:
+        tool_key: 호출할 MCP 도구 키 (server__tool 형식)
+        step: 현재 단계 계획 정보 (output_hint, input_hint 포함)
+        previous_steps: 이전 단계들의 계획 정보
+        previous_results: 이전 단계들의 실제 실행 결과 (Raw 텍스트)
+        llm: LLM 프로바이더
+        mcp: MCP 클라이언트 매니저
+        disk_image_path: 분석 대상 디스크 이미지 경로
+        max_retries: 검증 실패 시 최대 재시도 횟수
+
+    Returns:
+        검증을 통과한 tool arguments 딕셔너리
+    """
+    tools = await mcp.list_tools()
+    tool_obj = tools.get(tool_key)
+    schema = tool_obj.inputSchema if tool_obj and hasattr(tool_obj, "inputSchema") else {}
+    tool_schema = json.dumps(schema, ensure_ascii=False)
+    required_fields: list[str] = schema.get("required", [])
+
+    validation_error = ""
+    arguments: dict[str, Any] = {}
+
+    for attempt in range(max_retries):
+        # Reasoning: LLM이 Raw 출력에서 파라미터 추출
+        response = await llm.chat(
+            messages=[{"role": "user", "content": "파라미터를 추출해주세요."}],
+            tools=None,
+            system=build_step_mapper_prompt(
+                step,
+                previous_steps,
+                previous_results,
+                tool_schema,
+                disk_image_path=disk_image_path,
+                validation_error=validation_error,
+            ),
+        )
+        raw = response.content if isinstance(response.content, str) else "{}"
+        arguments = _extract_json_from_text(raw)
+
+        # Validation: required 필드 충족 여부 확인
+        missing = [f for f in required_fields if f not in arguments]
+        if not missing:
+            logger.info("prepare_arguments_success", tool=tool_key, attempt=attempt + 1, arguments=arguments)
+            return arguments
+
+        validation_error = f"필수 파라미터 누락: {missing}. 반드시 포함해야 합니다."
+        logger.warning("prepare_arguments_retry", tool=tool_key, missing=missing, attempt=attempt + 1)
+
+    logger.error("prepare_arguments_failed", tool=tool_key, arguments=arguments)
+    return arguments
+
+
 async def step_executor_node(
     state: AgentState,
     *,
@@ -466,9 +536,8 @@ async def step_executor_node(
         1. plan_steps[current_step_index]에서 현재 단계 정보 가져옴
         2. 도구가 'none'이면 MCP 호출 없이 수동 단계로 기록
         3. 도구가 있으면:
-           a. MCP에서 도구 스키마 조회
-           b. LLM(build_step_mapper_prompt)으로 이전 결과 → 도구 인자 변환
-           c. MCP 도구 호출
+           a. prepare_arguments_with_llm으로 인자 추출 (Extraction → Reasoning → Validation)
+           b. MCP 도구 호출 (Execution)
         4. 결과를 step_results에 추가하고 current_step_index 증가
     """
     steps = state["plan_steps"]
@@ -476,43 +545,26 @@ async def step_executor_node(
     step = steps[idx]
     tool_key = step.get("tool", "none")
     previous_results = state["step_results"]
+    previous_steps = steps[:idx]
 
     logger.info("step_executor_start", index=idx, step_name=step.get("name"), tool=tool_key)
 
     if not tool_key or tool_key.lower() == "none":
-        # 도구 없는 수동 단계 — LLM 호출 없이 목적만 기록
+        # 도구 없는 수동 단계
         output = f"[수동 단계] {step.get('purpose', '')}"
     else:
-        # 도구 스키마 조회
-        tools = await mcp.list_tools()
-        tool_obj = tools.get(tool_key)
-        tool_schema = (
-            json.dumps(tool_obj.inputSchema, ensure_ascii=False)
-            if tool_obj and hasattr(tool_obj, "inputSchema")
-            else "{}"
+        # Extraction → Reasoning → Validation
+        arguments = await prepare_arguments_with_llm(
+            tool_key=tool_key,
+            step=step,
+            previous_steps=previous_steps,
+            previous_results=previous_results,
+            llm=llm,
+            mcp=mcp,
+            disk_image_path=state.get("disk_image_path") or "",
         )
 
-        # 이전 단계들의 계획 정보 (output_hint 포함)
-        previous_steps = steps[:idx]
-
-        # LLM으로 이전 결과 → 현재 도구 인자 매핑
-        # output_hint(계획 시 정의)와 실제 출력을 함께 참조
-        mapper_response = await llm.chat(
-            messages=[{"role": "user", "content": "도구 호출 인자를 생성해주세요."}],
-            tools=None,
-            system=build_step_mapper_prompt(
-                step,
-                previous_steps,
-                previous_results,
-                tool_schema,
-                disk_image_path=state.get("disk_image_path") or "",
-            ),
-        )
-        raw = mapper_response.content if isinstance(mapper_response.content, str) else "{}"
-        arguments = _extract_json_from_text(raw)
-        logger.info("step_mapper_result", tool=tool_key, arguments=arguments)
-
-        # MCP 도구 호출
+        # Execution
         try:
             call_result = await mcp.call_tool(tool_key, arguments)
             output = mcp.get_tool_result_text(call_result)

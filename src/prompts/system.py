@@ -106,18 +106,19 @@ def build_step_mapper_prompt(
     previous_results: list[dict],
     tool_schema: str,
     disk_image_path: str = "",
+    validation_error: str = "",
 ) -> str:
-    """단계별 입력 매핑 프롬프트
+    """이전 단계 Raw 출력에서 다음 도구 파라미터를 추출하는 프롬프트
 
-    이전 단계의 output_hint(계획 시 정의된 출력 필드 설명)와
-    실제 출력(step_results)을 함께 참조하여 현재 도구의 인자를 생성.
+    Extraction → Reasoning → Validation 실패 시 재시도 흐름에서 사용.
 
     Args:
         step: 현재 단계 {index, name, tool, purpose, output_hint, input_hint}
         previous_steps: 이전 단계들의 계획 정보 (output_hint 포함)
-        previous_results: 이전 단계들의 실제 실행 결과
+        previous_results: 이전 단계들의 실제 실행 결과 (Raw 텍스트)
         tool_schema: 현재 도구의 inputSchema (JSON 문자열)
-        disk_image_path: 분석 대상 디스크 이미지 경로 (path 계열 파라미터에 사용)
+        disk_image_path: 분석 대상 디스크 이미지 경로
+        validation_error: 직전 시도 검증 실패 메시지 (재시도 시 전달)
     """
     # 이전 단계 output_hint + 실제 출력을 함께 구성
     if previous_steps and previous_results:
@@ -139,29 +140,32 @@ def build_step_mapper_prompt(
     current_output_hint = step.get("output_hint", {})
     input_hint = step.get("input_hint", "")
 
-    image_section = f"\n## 분석 대상 디스크 이미지\n{disk_image_path}" if disk_image_path else ""
+    image_section = f"\n## 분석 대상 디스크 이미지 경로\n{disk_image_path}\n" if disk_image_path else ""
+    retry_section = f"\n## 이전 시도 검증 오류 (반드시 수정)\n{validation_error}\n" if validation_error else ""
 
     return f"""당신은 디지털 포렌식 분석 AI입니다.
-현재 단계의 MCP 도구를 호출하기 위한 입력 인자를 JSON으로 생성하세요.
-{image_section}
-## 현재 단계
+아래 이전 단계의 Raw 출력에서 현재 도구 호출에 필요한 파라미터 값을 추출하세요.
+{image_section}{retry_section}
+## [Extraction] 이전 단계 Raw 출력
+{prev_section}
+
+## [Reasoning] 현재 도구 호출 정보
 - 단계: {step['index']}단계 - {step['name']}
 - 도구: {step['tool']}
 - 목적: {step['purpose']}
 - input_hint: {input_hint}
-- 이 단계 완료 후 출력될 필드 (output_hint): {current_output_hint}
 
-## 현재 도구의 입력 파라미터 스키마
+## [Validation 기준] 현재 도구 inputSchema
 {tool_schema}
-
-## 이전 단계 결과
-{prev_section}
 
 ---
 
-규칙:
-- path 계열 파라미터(path, image_path 등)에는 반드시 위의 디스크 이미지 경로를 사용하세요.
-- 나머지 파라미터는 input_hint와 이전 단계의 output_hint를 참고하여 채우세요.
+추출 규칙:
+1. path / image_path 등 이미지 경로 파라미터 → 반드시 위의 디스크 이미지 경로 사용
+2. 나머지 파라미터 → 이전 단계 Raw 출력과 input_hint를 참고하여 실제 값 추출
+3. schema의 required 필드는 반드시 포함
+4. 값을 찾을 수 없는 선택 파라미터는 생략
+
 설명 없이 JSON 객체만 출력합니다.
 예시: {{"path": "/image.dd", "log_path": "C:/Windows/System32/winevt/Logs/Security.evtx"}}"""
 
