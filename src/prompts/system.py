@@ -78,7 +78,96 @@ def build_planning_prompt(strategy: str, tool_summaries: str = "") -> str:
 
 ---
 
-도구가 없는 단계는 MCP 도구란에 "(없음 - 수동)"으로 표기하세요."""
+도구가 없는 단계는 MCP 도구란에 "(없음 - 수동)"으로 표기하세요.
+
+마지막으로 아래 JSON을 반드시 코드 블록 안에 포함하세요:
+
+```json
+{{
+  "steps": [
+    {{
+      "index": 1,
+      "name": "단계명",
+      "tool": "사용할_MCP_도구명 또는 none",
+      "purpose": "목적 한 줄",
+      "output_hint": {{
+        "필드명": "이 단계 실행 후 다음 단계에서 사용할 값 설명"
+      }},
+      "input_hint": "이전 단계의 output_hint 중 어떤 필드를 이 도구의 어떤 파라미터로 넘길지"
+    }}
+  ]
+}}
+```"""
+
+
+def build_step_mapper_prompt(
+    step: dict,
+    previous_steps: list[dict],
+    previous_results: list[dict],
+    tool_schema: str,
+    disk_image_path: str = "",
+    validation_error: str = "",
+) -> str:
+    """이전 단계 Raw 출력에서 다음 도구 파라미터를 추출하는 프롬프트
+
+    Extraction → Reasoning → Validation 실패 시 재시도 흐름에서 사용.
+
+    Args:
+        step: 현재 단계 {index, name, tool, purpose, output_hint, input_hint}
+        previous_steps: 이전 단계들의 계획 정보 (output_hint 포함)
+        previous_results: 이전 단계들의 실제 실행 결과 (Raw 텍스트)
+        tool_schema: 현재 도구의 inputSchema (JSON 문자열)
+        disk_image_path: 분석 대상 디스크 이미지 경로
+        validation_error: 직전 시도 검증 실패 메시지 (재시도 시 전달)
+    """
+    # 이전 단계 output_hint + 실제 출력을 함께 구성
+    if previous_steps and previous_results:
+        prev_section = "\n\n".join(
+            f"[{r['step']}단계 - {r['name']}]\n"
+            f"output_hint: {previous_steps[i].get('output_hint', {})}\n"
+            f"실제 출력:\n{r['output']}"
+            for i, r in enumerate(previous_results)
+            if i < len(previous_steps)
+        )
+    elif previous_results:
+        prev_section = "\n\n".join(
+            f"[{r['step']}단계 - {r['name']}]\n실제 출력:\n{r['output']}"
+            for r in previous_results
+        )
+    else:
+        prev_section = "(첫 번째 단계, 이전 결과 없음)"
+
+    current_output_hint = step.get("output_hint", {})
+    input_hint = step.get("input_hint", "")
+
+    image_section = f"\n## 분석 대상 디스크 이미지 경로\n{disk_image_path}\n" if disk_image_path else ""
+    retry_section = f"\n## 이전 시도 검증 오류 (반드시 수정)\n{validation_error}\n" if validation_error else ""
+
+    return f"""당신은 디지털 포렌식 분석 AI입니다.
+아래 이전 단계의 Raw 출력에서 현재 도구 호출에 필요한 파라미터 값을 추출하세요.
+{image_section}{retry_section}
+## [Extraction] 이전 단계 Raw 출력
+{prev_section}
+
+## [Reasoning] 현재 도구 호출 정보
+- 단계: {step['index']}단계 - {step['name']}
+- 도구: {step['tool']}
+- 목적: {step['purpose']}
+- input_hint: {input_hint}
+
+## [Validation 기준] 현재 도구 inputSchema
+{tool_schema}
+
+---
+
+추출 규칙:
+1. path / image_path 등 이미지 경로 파라미터 → 반드시 위의 디스크 이미지 경로 사용
+2. 나머지 파라미터 → 이전 단계 Raw 출력과 input_hint를 참고하여 실제 값 추출
+3. schema의 required 필드는 반드시 포함
+4. 값을 찾을 수 없는 선택 파라미터는 생략
+
+설명 없이 JSON 객체만 출력합니다.
+예시: {{"path": "/image.dd", "log_path": "C:/Windows/System32/winevt/Logs/Security.evtx"}}"""
 
 
 def build_summary_prompt(step_results: list[dict]) -> str:
