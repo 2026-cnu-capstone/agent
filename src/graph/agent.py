@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict
 from functools import partial
 from typing import Any
@@ -22,7 +23,12 @@ from llm_provider.tool_converter import (
     mcp_tools_to_openai,
 )
 from mcp_client.client import MCPClientManager
-from prompts.system import build_planning_prompt, build_strategy_prompt, build_system_prompt
+from prompts.system import (
+    build_planning_prompt,
+    build_step_mapper_prompt,
+    build_strategy_prompt,
+    build_system_prompt,
+)
 
 logger = structlog.get_logger()
 
@@ -400,6 +406,206 @@ def create_planning_state(
         analysis_strategy=strategy,
         analysis_plan="",
         plan_steps=[],
+        current_step_index=0,
+        step_results=[],
+    )
+
+
+# ── 파이프라인 실행 ────────────────────────────────────────
+
+
+def parse_plan_steps(plan_text: str) -> list[dict[str, Any]]:
+    """계획 텍스트에서 JSON 단계 목록 파싱
+
+    build_planning_prompt이 생성한 ```json ... ``` 블록을 추출하여 파싱.
+    파싱 실패 시 빈 리스트 반환.
+
+    Returns:
+        [{index, name, tool, purpose, input_hint}, ...] 형태의 단계 목록
+    """
+    match = re.search(r"```json\s*(\{.*?\})\s*```", plan_text, re.DOTALL)
+    if not match:
+        logger.warning("plan_steps_json_not_found")
+        return []
+    try:
+        data = json.loads(match.group(1))
+        return data.get("steps", [])
+    except json.JSONDecodeError:
+        logger.warning("plan_steps_json_parse_failed")
+        return []
+
+
+def _extract_json_from_text(text: str) -> dict[str, Any]:
+    """LLM 응답 텍스트에서 JSON 객체 추출
+
+    순수 JSON 응답이 아닌 경우(설명 포함)도 처리.
+    추출 실패 시 빈 딕셔너리 반환.
+    """
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+async def step_executor_node(
+    state: AgentState,
+    *,
+    llm: BaseLLMProvider,
+    mcp: MCPClientManager,
+) -> dict[str, Any]:
+    """파이프라인의 현재 단계 실행
+
+    흐름:
+        1. plan_steps[current_step_index]에서 현재 단계 정보 가져옴
+        2. 도구가 'none'이면 MCP 호출 없이 수동 단계로 기록
+        3. 도구가 있으면:
+           a. MCP에서 도구 스키마 조회
+           b. LLM(build_step_mapper_prompt)으로 이전 결과 → 도구 인자 변환
+           c. MCP 도구 호출
+        4. 결과를 step_results에 추가하고 current_step_index 증가
+    """
+    steps = state["plan_steps"]
+    idx = state["current_step_index"]
+    step = steps[idx]
+    tool_key = step.get("tool", "none")
+    previous_results = state["step_results"]
+
+    logger.info("step_executor_start", index=idx, step_name=step.get("name"), tool=tool_key)
+
+    if not tool_key or tool_key.lower() == "none":
+        # 도구 없는 수동 단계 — LLM 호출 없이 목적만 기록
+        output = f"[수동 단계] {step.get('purpose', '')}"
+    else:
+        # 도구 스키마 조회
+        tools = await mcp.list_tools()
+        tool_obj = tools.get(tool_key)
+        tool_schema = (
+            json.dumps(tool_obj.inputSchema, ensure_ascii=False)
+            if tool_obj and hasattr(tool_obj, "inputSchema")
+            else "{}"
+        )
+
+        # 이전 단계들의 계획 정보 (output_hint 포함)
+        previous_steps = steps[:idx]
+
+        # LLM으로 이전 결과 → 현재 도구 인자 매핑
+        # output_hint(계획 시 정의)와 실제 출력을 함께 참조
+        mapper_response = await llm.chat(
+            messages=[{"role": "user", "content": "도구 호출 인자를 생성해주세요."}],
+            tools=None,
+            system=build_step_mapper_prompt(
+                step,
+                previous_steps,
+                previous_results,
+                tool_schema,
+                disk_image_path=state.get("disk_image_path") or "",
+            ),
+        )
+        raw = mapper_response.content if isinstance(mapper_response.content, str) else "{}"
+        arguments = _extract_json_from_text(raw)
+        logger.info("step_mapper_result", tool=tool_key, arguments=arguments)
+
+        # MCP 도구 호출
+        try:
+            call_result = await mcp.call_tool(tool_key, arguments)
+            output = mcp.get_tool_result_text(call_result)
+        except Exception as exc:
+            logger.error("step_tool_call_failed", tool=tool_key, error=str(exc))
+            output = f"Error: {exc}"
+
+    step_result: dict[str, Any] = {
+        "step": step["index"],
+        "name": step.get("name", ""),
+        "tool": tool_key,
+        "output": output,
+    }
+
+    return {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": f"[{step['index']}단계 완료] {step.get('name', '')}: {output[:300]}",
+            }
+        ],
+        "step_results": previous_results + [step_result],
+        "current_step_index": idx + 1,
+    }
+
+
+def pipeline_router(state: AgentState) -> str:
+    """실행할 단계가 남아 있으면 계속, 없으면 종료"""
+    if state["current_step_index"] < len(state["plan_steps"]):
+        return "step"
+    return "end"
+
+
+def build_pipeline_graph(
+    llm: BaseLLMProvider,
+    mcp: MCPClientManager,
+    db_engine: AsyncEngine,
+) -> Any:
+    """파이프라인 실행 그래프
+
+    그래프 토폴로지:
+        START → intake → [intake_router] → END (검증 실패)
+                                         → step (검증 성공)
+        step → [pipeline_router] → step (다음 단계)
+                                 → END (모든 단계 완료)
+
+    plan_steps를 순서대로 실행하며, 각 단계마다 LLM이
+    이전 결과를 현재 도구 인자로 매핑.
+    """
+    graph = StateGraph(AgentState)
+
+    graph.add_node("intake", partial(intake_node, db_engine=db_engine))
+    graph.add_node("step", partial(step_executor_node, llm=llm, mcp=mcp))
+
+    graph.add_edge(START, "intake")
+    graph.add_conditional_edges(
+        "intake",
+        intake_router,
+        {"llm": "step", "end": END},
+    )
+    graph.add_conditional_edges(
+        "step",
+        pipeline_router,
+        {"step": "step", "end": END},
+    )
+
+    return graph.compile()
+
+
+def create_execution_state(
+    user_message: str,
+    analysis_plan: str,
+    plan_steps: list[dict[str, Any]],
+    disk_image_path: str | None = None,
+    disk_image_format: str | None = None,
+) -> AgentState:
+    """파이프라인 실행용 초기 상태 생성
+
+    parse_plan_steps()로 파싱된 plan_steps를 받아
+    step_executor_node가 순서대로 소비할 수 있도록 설정.
+    """
+    return AgentState(
+        messages=[{"role": "user", "content": user_message}],
+        tools={},
+        pending_tool_calls=[],
+        iteration_count=0,
+        phase="intake",
+        case_id=None,
+        disk_image_path=disk_image_path,
+        disk_image_format=disk_image_format,
+        analysis_strategy="",
+        analysis_plan=analysis_plan,
+        plan_steps=plan_steps,
         current_step_index=0,
         step_results=[],
     )

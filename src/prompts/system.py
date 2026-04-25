@@ -78,7 +78,92 @@ def build_planning_prompt(strategy: str, tool_summaries: str = "") -> str:
 
 ---
 
-도구가 없는 단계는 MCP 도구란에 "(없음 - 수동)"으로 표기하세요."""
+도구가 없는 단계는 MCP 도구란에 "(없음 - 수동)"으로 표기하세요.
+
+마지막으로 아래 JSON을 반드시 코드 블록 안에 포함하세요:
+
+```json
+{{
+  "steps": [
+    {{
+      "index": 1,
+      "name": "단계명",
+      "tool": "사용할_MCP_도구명 또는 none",
+      "purpose": "목적 한 줄",
+      "output_hint": {{
+        "필드명": "이 단계 실행 후 다음 단계에서 사용할 값 설명"
+      }},
+      "input_hint": "이전 단계의 output_hint 중 어떤 필드를 이 도구의 어떤 파라미터로 넘길지"
+    }}
+  ]
+}}
+```"""
+
+
+def build_step_mapper_prompt(
+    step: dict,
+    previous_steps: list[dict],
+    previous_results: list[dict],
+    tool_schema: str,
+    disk_image_path: str = "",
+) -> str:
+    """단계별 입력 매핑 프롬프트
+
+    이전 단계의 output_hint(계획 시 정의된 출력 필드 설명)와
+    실제 출력(step_results)을 함께 참조하여 현재 도구의 인자를 생성.
+
+    Args:
+        step: 현재 단계 {index, name, tool, purpose, output_hint, input_hint}
+        previous_steps: 이전 단계들의 계획 정보 (output_hint 포함)
+        previous_results: 이전 단계들의 실제 실행 결과
+        tool_schema: 현재 도구의 inputSchema (JSON 문자열)
+        disk_image_path: 분석 대상 디스크 이미지 경로 (path 계열 파라미터에 사용)
+    """
+    # 이전 단계 output_hint + 실제 출력을 함께 구성
+    if previous_steps and previous_results:
+        prev_section = "\n\n".join(
+            f"[{r['step']}단계 - {r['name']}]\n"
+            f"output_hint: {previous_steps[i].get('output_hint', {})}\n"
+            f"실제 출력:\n{r['output']}"
+            for i, r in enumerate(previous_results)
+            if i < len(previous_steps)
+        )
+    elif previous_results:
+        prev_section = "\n\n".join(
+            f"[{r['step']}단계 - {r['name']}]\n실제 출력:\n{r['output']}"
+            for r in previous_results
+        )
+    else:
+        prev_section = "(첫 번째 단계, 이전 결과 없음)"
+
+    current_output_hint = step.get("output_hint", {})
+    input_hint = step.get("input_hint", "")
+
+    image_section = f"\n## 분석 대상 디스크 이미지\n{disk_image_path}" if disk_image_path else ""
+
+    return f"""당신은 디지털 포렌식 분석 AI입니다.
+현재 단계의 MCP 도구를 호출하기 위한 입력 인자를 JSON으로 생성하세요.
+{image_section}
+## 현재 단계
+- 단계: {step['index']}단계 - {step['name']}
+- 도구: {step['tool']}
+- 목적: {step['purpose']}
+- input_hint: {input_hint}
+- 이 단계 완료 후 출력될 필드 (output_hint): {current_output_hint}
+
+## 현재 도구의 입력 파라미터 스키마
+{tool_schema}
+
+## 이전 단계 결과
+{prev_section}
+
+---
+
+규칙:
+- path 계열 파라미터(path, image_path 등)에는 반드시 위의 디스크 이미지 경로를 사용하세요.
+- 나머지 파라미터는 input_hint와 이전 단계의 output_hint를 참고하여 채우세요.
+설명 없이 JSON 객체만 출력합니다.
+예시: {{"path": "/image.dd", "log_path": "C:/Windows/System32/winevt/Logs/Security.evtx"}}"""
 
 
 def build_summary_prompt(step_results: list[dict]) -> str:
