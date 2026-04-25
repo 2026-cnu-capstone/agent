@@ -16,7 +16,11 @@ import argparse
 import asyncio
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
+
+from docx import Document
+from docx.shared import Pt
 
 import structlog
 
@@ -25,10 +29,13 @@ from database.engine import get_engine, init_db
 from disk_image_validator import validate_image_path
 from graph.agent import (
     build_agent_graph,
+    build_pipeline_graph,
     build_planning_graph,
     build_strategy_graph,
+    create_execution_state,
     create_initial_state,
     create_planning_state,
+    parse_plan_steps,
 )
 from llm_provider.base import BaseLLMProvider
 from llm_provider.anthropic import AnthropicProvider
@@ -268,6 +275,44 @@ async def generate_report(
     return response.content if isinstance(response.content, str) else ""
 
 
+def save_report(report: str, output_dir: Path | None = None) -> Path:
+    """보고서를 docs 디렉터리에 Word(.docx) 파일로 저장
+
+    파일명: report_YYYYMMDD_HHMMSS.docx
+    output_dir 미지정 시 프로젝트 루트의 docs/ 사용.
+
+    마크다운 헤더(# / ##)는 Word Heading 스타일로,
+    나머지 줄은 Normal 단락으로 변환.
+
+    Returns:
+        저장된 파일 경로
+    """
+    if output_dir is None:
+        output_dir = Path(__file__).parent.parent / "docs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    doc = Document()
+
+    for line in report.splitlines():
+        if line.startswith("# "):
+            doc.add_heading(line[2:].strip(), level=1)
+        elif line.startswith("## "):
+            doc.add_heading(line[3:].strip(), level=2)
+        elif line.startswith("### "):
+            doc.add_heading(line[4:].strip(), level=3)
+        elif line.strip() == "":
+            doc.add_paragraph()
+        else:
+            p = doc.add_paragraph(line.strip())
+            for run in p.runs:
+                run.font.size = Pt(11)
+
+    filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+    file_path = output_dir / filename
+    doc.save(str(file_path))
+    return file_path
+
+
 # ── 메인 ─────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
@@ -327,6 +372,7 @@ async def main() -> None:
         print_tools(tools, verbose=args.verbose)
 
         agent_graph = build_agent_graph(llm, mcp, db_engine)
+        pipeline_graph = build_pipeline_graph(llm, mcp, db_engine)
 
         print("\n===== Forensic Agent =====")
 
@@ -351,22 +397,75 @@ async def main() -> None:
                 # ── 1단계: 전략 수립 (HITL) ──────────────────────
                 strategy = await run_strategy_hitl(strategy_graph, user_input)
 
-                # ── 2단계: 계획 수립 (HITL) ──────────────────────
-                analysis_plan = await run_planning_hitl(
-                    planning_graph, user_input, strategy, tools
-                )
+                # ── 분석 반복 루프 (계획 → 실행 → 요약 → 게이트) ──
+                accumulated_results: list[dict] = []
+                planning_context = user_input  # 추가 분석 시 요청 내용을 덧붙여 갱신
 
-                # 계획 확정 후 다음 사건 입력으로 이동
-                print("\n계획이 확정되었습니다. 새 사건을 입력하거나 quit으로 종료하세요.")
+                while True:
+                    # 2단계: 계획 수립 (HITL)
+                    analysis_plan = await run_planning_hitl(
+                        planning_graph,
+                        planning_context,
+                        strategy,
+                        tools,
+                        accumulated_results or None,
+                    )
 
-                # TODO: 에이전트 실행 단계 추가 예정
-                # exec_state = create_initial_state(
-                #     user_message=user_input,
-                #     disk_image_path=image_path,
-                #     disk_image_format=image_format,
-                #     analysis_plan=analysis_plan,
-                # )
-                # exec_result = await agent_graph.ainvoke(exec_state)
+                    # 3단계: 파이프라인 실행
+                    plan_steps = parse_plan_steps(analysis_plan)
+                    if not plan_steps:
+                        print("[Warning] 실행 가능한 단계가 없습니다.")
+                        break
+
+                    print(f"\n[3단계] 파이프라인 실행 중... ({len(plan_steps)}단계)")
+                    exec_state = create_execution_state(
+                        user_message=user_input,
+                        analysis_plan=analysis_plan,
+                        plan_steps=plan_steps,
+                        disk_image_path=image_path,
+                        disk_image_format=image_format,
+                    )
+                    exec_result = await pipeline_graph.ainvoke(exec_state)
+                    step_results: list[dict] = exec_result.get("step_results", [])
+                    accumulated_results.extend(step_results)
+
+                    # 결과 요약 생성 및 출력
+                    print("\n[4단계] 결과 요약 중...")
+                    summary = await generate_summary(llm, step_results)
+                    print_section("분석 결과 요약", summary)
+
+                    # 게이트: r=보고서 생성 / a=추가 분석 / q=종료
+                    gate = (
+                        await async_input(
+                            "다음 작업을 선택하세요 (r: 보고서 생성 / a: 추가 분석 / q: 종료) > "
+                        )
+                    ).lower()
+
+                    if gate == "r":
+                        print("\n[5단계] 최종 보고서 작성 중...")
+                        report = await generate_report(
+                            llm, user_input, strategy, accumulated_results
+                        )
+                        print_section("포렌식 분석 보고서", report)
+                        saved_path = save_report(report)
+                        print(f"[보고서 저장] {saved_path}")
+                        break
+                    elif gate == "a":
+                        # 추가 조사할 내용을 입력받아 계획 컨텍스트에 반영
+                        additional = ""
+                        while not additional:
+                            additional = await async_input(
+                                "추가로 조사할 내용을 입력하세요 > "
+                            )
+                            if not additional:
+                                print("[알림] 조사할 내용을 입력해야 합니다.")
+                        planning_context = (
+                            f"{user_input}\n\n[추가 조사 요청]: {additional}"
+                        )
+                        continue
+                    else:
+                        # q 또는 기타
+                        break
 
             except Exception as e:
                 print(f"\n[Error] {e}\n")
