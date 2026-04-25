@@ -22,11 +22,68 @@ from llm_provider.tool_converter import (
     mcp_tools_to_openai,
 )
 from mcp_client.client import MCPClientManager
-from prompts.system import build_system_prompt
+from prompts.system import build_planning_prompt, build_strategy_prompt, build_system_prompt
 
 logger = structlog.get_logger()
 
 MAX_ITERATIONS = 20
+
+
+async def strategy_node(
+    state: AgentState,
+    *,
+    llm: BaseLLMProvider,
+) -> dict[str, Any]:
+    """사용자 사건 입력을 바탕으로 분석 전략 수립
+
+    무엇을 조사할지, 어떤 방향으로 접근할지 고수준 전략 도출
+    수립된 전략은 state["analysis_strategy"]에 저장됨
+    """
+    response = await llm.chat(
+        messages=state["messages"],
+        tools=None,
+        system=build_strategy_prompt(),
+    )
+
+    strategy_text = response.content if isinstance(response.content, str) else ""
+    logger.info("analysis_strategy_created", length=len(strategy_text))
+
+    return {
+        "messages": [{"role": "assistant", "content": response.content}],
+        "analysis_strategy": strategy_text,
+        "pending_tool_calls": [],
+        "phase": "planning",
+    }
+
+
+async def planning_node(
+    state: AgentState,
+    *,
+    llm: BaseLLMProvider,
+) -> dict[str, Any]:
+    """수립된 전략을 바탕으로 세부 실행 계획 수립
+
+    strategy_node의 결과를 입력으로 받아 단계별 실행 계획 생성
+    수립된 계획은 state["analysis_plan"]에 저장됨
+    """
+    response = await llm.chat(
+        messages=state["messages"],
+        tools=None,
+        system=build_planning_prompt(
+            state.get("analysis_strategy", ""),
+            format_tool_summaries(state.get("tools") or {}),
+        ),
+    )
+
+    plan_text = response.content if isinstance(response.content, str) else ""
+    logger.info("analysis_plan_created", length=len(plan_text))
+
+    return {
+        "messages": [{"role": "assistant", "content": response.content}],
+        "analysis_plan": plan_text,
+        "pending_tool_calls": [],
+        "phase": "execution",
+    }
 
 
 def _serialize_tool_calls(
@@ -71,7 +128,7 @@ async def llm_node(
         tool_params = mcp_tools_to_anthropic(tools)
     else:
         tool_params = mcp_tools_to_openai(tools)
-    system = build_system_prompt(format_tool_summaries(tools))
+    system = build_system_prompt(format_tool_summaries(tools), state.get("analysis_plan", ""))
 
     response = await llm.chat(
         messages=state["messages"],
@@ -228,6 +285,33 @@ def should_continue(state: AgentState) -> str:
     return "end"
 
 
+def build_strategy_graph(llm: BaseLLMProvider) -> Any:
+    """전략 수립 전용 그래프 (MCP 불필요)
+
+    START → strategy → END
+    result["analysis_strategy"]에 전략 텍스트가 담겨 반환됨
+    """
+    graph = StateGraph(AgentState)
+    graph.add_node("strategy", partial(strategy_node, llm=llm))
+    graph.add_edge(START, "strategy")
+    graph.add_edge("strategy", END)
+    return graph.compile()
+
+
+def build_planning_graph(llm: BaseLLMProvider) -> Any:
+    """계획 수립 전용 그래프 (MCP 불필요)
+
+    START → planning → END
+    state["analysis_strategy"]를 바탕으로 세부 계획 생성
+    result["analysis_plan"]에 계획 텍스트가 담겨 반환됨
+    """
+    graph = StateGraph(AgentState)
+    graph.add_node("planning", partial(planning_node, llm=llm))
+    graph.add_edge(START, "planning")
+    graph.add_edge("planning", END)
+    return graph.compile()
+
+
 def build_agent_graph(
     llm: BaseLLMProvider,
     mcp: MCPClientManager,
@@ -271,6 +355,7 @@ def create_initial_state(
     user_message: str,
     disk_image_path: str | None = None,
     disk_image_format: str | None = None,
+    analysis_plan: str = "",
 ) -> AgentState:
     """사용자 메시지 기반 초기 에이전트 상태 생성
 
@@ -278,9 +363,7 @@ def create_initial_state(
         user_message: 사용자 입력 메시지
         disk_image_path: 사전 검증된 디스크 이미지 경로
         disk_image_format: 디스크 이미지 형식 (e01, dd, raw)
-
-    Returns:
-        초기 에이전트 상태
+        analysis_plan: 확정된 분석 계획 텍스트 (실행 단계에서 시스템 프롬프트에 주입)
     """
     return AgentState(
         messages=[{"role": "user", "content": user_message}],
@@ -291,4 +374,32 @@ def create_initial_state(
         case_id=None,
         disk_image_path=disk_image_path,
         disk_image_format=disk_image_format,
+        analysis_strategy="",
+        analysis_plan=analysis_plan,
+        plan_steps=[],
+        current_step_index=0,
+        step_results=[],
+    )
+
+
+def create_planning_state(
+    user_message: str,
+    strategy: str,
+    tools: dict | None = None,
+) -> AgentState:
+    """전략이 확정된 후 계획 수립용 상태 생성"""
+    return AgentState(
+        messages=[{"role": "user", "content": user_message}],
+        tools=tools or {},
+        pending_tool_calls=[],
+        iteration_count=0,
+        phase="planning",
+        case_id=None,
+        disk_image_path=None,
+        disk_image_format=None,
+        analysis_strategy=strategy,
+        analysis_plan="",
+        plan_steps=[],
+        current_step_index=0,
+        step_results=[],
     )
