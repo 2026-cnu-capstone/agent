@@ -51,6 +51,10 @@ class MCPConfig(BaseModel):
         default_factory=dict
     )
     tool_cache_ttl_seconds: int = 300
+    agent_mapping: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="에이전트별 MCP 서버 매핑. 미설정 시 서버명 == 에이전트명 자동 매핑",
+    )
 
 
 class LLMProvider(str, Enum):
@@ -66,7 +70,7 @@ class LLMConfig(BaseModel):
     provider: LLMProvider = LLMProvider.ANTHROPIC
     model: str = "claude-sonnet-4-20250514"
     temperature: float = 0.0
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     base_url: str | None = None
 
 
@@ -74,10 +78,13 @@ class Settings(BaseSettings):
     """애플리케이션 전체 설정
 
     환경변수 매핑:
-        LLM_API_KEY    → llm_api_key
-        LLM_MODEL      → llm.model (load_settings에서 처리)
-        LLM_BASE_URL   → llm.base_url (load_settings에서 처리)
-        DATABASE_URL   → database_url
+        LLM_API_KEY            → llm_api_key (기본 OpenAI)
+        LLM_MODEL              → llm.model (load_settings에서 처리)
+        LLM_BASE_URL           → llm.base_url (load_settings에서 처리)
+        MINDLOGIC_API_KEY      → mindlogic_api_key (MindLogic Gateway)
+        MINDLOGIC_BASE_URL     → mindlogic_base_url
+        MINDLOGIC_MODEL        → mindlogic_model
+        DATABASE_URL           → database_url
     """
 
     model_config = SettingsConfigDict(
@@ -92,6 +99,11 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = ""
     llm_base_url: str = ""
+
+    mindlogic_api_key: str = ""
+    mindlogic_base_url: str = "https://factchat-cloud.mindlogic.ai/v1/gateway"
+    mindlogic_model: str = "claude-sonnet-4-6"
+
     database_url: str = ""
 
 
@@ -137,7 +149,8 @@ def _load_mcp_from_json(path: Path) -> MCPConfig:
                 cwd=cfg.get("cwd"),
             )
 
-    return MCPConfig(servers=servers)
+    agent_mapping = raw.get("agentMapping", {})
+    return MCPConfig(servers=servers, agent_mapping=agent_mapping)
 
 
 def load_settings(config_path: Path | None = None) -> Settings:

@@ -37,3 +37,6 @@ uv.lock
 
 # Config
 config/mcp_servers.json
+
+# Test cache
+.cache/

@@ -13,13 +13,12 @@ from langgraph.graph import END, START, StateGraph
 from llm_provider.anthropic import AnthropicProvider
 from llm_provider.base import BaseLLMProvider, ToolResult
 from llm_provider.tool_converter import mcp_tools_to_anthropic, mcp_tools_to_openai
+from constants import DEFAULT_MAX_ITERATIONS
 from mcp_client.client import MCPClientManager
 from state.messages import TaskResult as TaskResultType
 from state.sub_agent import SubAgentState
 
 logger = structlog.get_logger()
-
-DEFAULT_MAX_ITERATIONS = 10
 
 
 async def sub_agent_llm_node(
@@ -140,13 +139,32 @@ async def sub_agent_tool_node(
     }
 
 
+def _is_error_chunk(chunk: str) -> bool:
+    """도구 출력 청크가 에러 응답인지 판별
+
+    MCP 도구가 isError=false로 반환하지만 실제로는 에러인 경우를 탐지
+    """
+    if "Error:" in chunk:
+        return True
+
+    try:
+        import json as _json
+        data = _json.loads(chunk)
+        if isinstance(data, dict) and "error" in data:
+            return True
+    except (ValueError, TypeError):
+        pass
+
+    return False
+
+
 async def sub_agent_finalize_node(
     state: SubAgentState,
 ) -> dict[str, Any]:
     """Sub-Agent 실행 완료 후 TaskResult 생성
 
-    output_chunks와 최종 assistant 메시지를 기반으로
-    Manager에 반환할 TaskResult를 구성
+    LLM의 최종 분석 메시지를 우선 사용하고,
+    도구 출력은 보조 데이터로 활용
     """
     task = state["task"]
     chunks = state["output_chunks"]
@@ -155,20 +173,30 @@ async def sub_agent_finalize_node(
     for msg in reversed(state["messages"]):
         if msg.get("role") == "assistant" and msg.get("content"):
             content = msg["content"]
-            if isinstance(content, str):
+            if isinstance(content, str) and content.strip():
                 last_content = content
                 break
 
-    combined_output = "\n---\n".join(chunks) if chunks else last_content
-    has_error = any("Error:" in chunk for chunk in chunks)
+    valid_chunks = [c for c in chunks if not _is_error_chunk(c)]
+    error_chunks = [c for c in chunks if _is_error_chunk(c)]
+
+    if last_content:
+        output = last_content
+    elif valid_chunks:
+        output = "\n---\n".join(valid_chunks)
+    else:
+        output = "\n---\n".join(chunks) if chunks else ""
+
+    has_error = bool(error_chunks) and not valid_chunks and not last_content
 
     result: TaskResultType = {
         "task_id": task["task_id"],
         "agent_name": task["agent_name"],
         "status": "error" if has_error else "success",
-        "output": combined_output,
+        "output": output,
         "raw_output_ref": "",
         "artifacts": [],
+        "follow_up": None,
     }
 
     return {"result": result}
@@ -246,11 +274,21 @@ def create_sub_agent_state(
     step = task.get("step", {})
     context = task.get("context", "")
     purpose = step.get("purpose", "")
+    hints = step.get("hints", "")
+    artifacts = step.get("artifacts", [])
+    disk_image_path = task.get("disk_image_path", "")
 
-    initial_message = (
-        f"작업: {purpose}\n"
-        f"컨텍스트: {context}" if context else f"작업: {purpose}"
-    )
+    parts = [f"작업: {purpose}"]
+    if artifacts:
+        parts.append(f"분석 대상 아티팩트: {', '.join(artifacts)}")
+    if hints:
+        parts.append(f"힌트: {hints}")
+    if disk_image_path:
+        parts.append(f"디스크 이미지 경로: {disk_image_path}")
+    if context:
+        parts.append(f"이전 단계 결과:\n{context}")
+
+    initial_message = "\n".join(parts)
 
     return SubAgentState(
         messages=[{"role": "user", "content": initial_message}],
@@ -261,4 +299,5 @@ def create_sub_agent_state(
         max_iterations=max_iterations,
         output_chunks=[],
         result=None,
+        dfxml_fragment="",
     )
