@@ -1,8 +1,11 @@
-"""Dissect Sub-Agent 전용 시스템 프롬프트
+"""Dissect Sub-Agent 프롬프트
 
-도구를 카테고리별로 분류하여 LLM의 도구 선택 범위를 축소하고
-정확도를 향상시키는 전용 프롬프트
+사용처:
+    - src/agents/dissect/prompts.py → build_dissect_prompt (시스템 프롬프트 조립)
+    - src/agents/dissect/graph.py → dissect_finalize_node (FOLLOWUP 마커 정의)
 """
+
+from __future__ import annotations
 
 DISSECT_SYSTEM_PROMPT = """\
 당신은 Dissect 포렌식 도구를 운용하는 Sub-Agent입니다.
@@ -67,6 +70,25 @@ DISSECT_SYSTEM_PROMPT = """\
 추가 조사가 불필요하면 위 마커를 출력하지 마세요."""
 
 
+DFXML_FRAGMENT_PROMPT = """\
+당신은 디지털 포렌식 데이터 변환 전문가입니다.
+아래 분석 결과를 DFXML 프래그먼트로 변환하세요.
+
+## 분석 정보
+- 에이전트: {agent_name}
+- 작업 목적: {task_purpose}
+
+## 분석 결과
+{analysis_output}
+
+## 변환 지침
+- <dfxml_fragment> 루트 요소로 감싸기
+- 발견된 각 항목을 <fileobject>, <registry_object>, <event> 등 적절한 요소로 매핑
+- 타임스탬프는 ISO 8601 형식 사용
+- 발견된 증거가 없으면 빈 <dfxml_fragment/> 반환
+- 유효한 XML만 반환 (설명 텍스트 없이)"""
+
+
 def build_dissect_prompt(purpose: str = "", available_plugins: str = "") -> str:
     """작업 목적을 포함한 Dissect Sub-Agent 시스템 프롬프트 생성
 
@@ -80,3 +102,22 @@ def build_dissect_prompt(purpose: str = "", available_plugins: str = "") -> str:
     if purpose:
         parts.append(f"## 현재 작업 목적\n{purpose}")
     return "\n\n".join(parts)
+
+
+def build_dfxml_fragment_prompt(
+    agent_name: str,
+    task_purpose: str,
+    analysis_output: str,
+) -> str:
+    """단일 Sub-Agent 분석 결과를 DFXML 프래그먼트로 변환하는 프롬프트
+
+    Args:
+        agent_name: Sub-Agent 이름
+        task_purpose: 작업 목적
+        analysis_output: 분석 결과 텍스트
+    """
+    return DFXML_FRAGMENT_PROMPT.format(
+        agent_name=agent_name,
+        task_purpose=task_purpose,
+        analysis_output=analysis_output[:3000],
+    )

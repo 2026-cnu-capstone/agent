@@ -1,7 +1,7 @@
-"""Report Agent 전용 프롬프트
+"""Report Agent 프롬프트
 
-기존 prompts/system.py의 build_summary_prompt, build_report_prompt를 이전하고
-DFXML 변환 프롬프트를 추가
+사용처:
+    - src/agents/report/nodes.py → summary_node, report_node, dfxml_node
 """
 
 from __future__ import annotations

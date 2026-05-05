@@ -6,7 +6,7 @@ from typing import Any
 
 import structlog
 
-from agents.report.prompts import (
+from prompts.report import (
     build_dfxml_merge_prompt,
     build_dfxml_prompt,
     build_report_prompt,
