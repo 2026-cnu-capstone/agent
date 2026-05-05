@@ -8,12 +8,10 @@ from __future__ import annotations
 
 import structlog
 
+from constants import SUMMARIZE_THRESHOLD
 from llm_provider.base import BaseLLMProvider
 
 logger = structlog.get_logger()
-
-SUMMARIZE_THRESHOLD = 5000
-"""요약을 적용하는 출력 길이 임계치 (문자 수)"""
 
 _SUMMARIZE_PROMPT = """\
 당신은 디지털 포렌식 분석 AI입니다.

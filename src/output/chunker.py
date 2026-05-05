@@ -8,15 +8,10 @@ from __future__ import annotations
 
 import structlog
 
+from constants import CHUNK_SIZE, CHUNK_THRESHOLD
 from llm_provider.base import BaseLLMProvider
 
 logger = structlog.get_logger()
-
-CHUNK_SIZE = 8000
-"""청크당 최대 문자 수"""
-
-CHUNK_THRESHOLD = 20000
-"""Map-Reduce를 적용하는 출력 길이 임계치"""
 
 _MAP_PROMPT = """\
 당신은 디지털 포렌식 분석 AI입니다.
