@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
 import openai
+import structlog
 
 from config import LLMConfig
+from constants import LLM_INITIAL_BACKOFF, LLM_MAX_RETRIES
 from llm_provider.base import BaseLLMProvider, LLMResponse, ToolCall, ToolResult
+
+logger = structlog.get_logger()
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -27,7 +32,7 @@ class OpenAIProvider(BaseLLMProvider):
         tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
     ) -> LLMResponse:
-        """OpenAI chat completions API 호출"""
+        """OpenAI chat completions API 호출 (429 에러 시 자동 재시도)"""
         api_messages = list(messages)
         if system:
             api_messages.insert(0, {"role": "system", "content": system})
@@ -40,6 +45,22 @@ class OpenAIProvider(BaseLLMProvider):
         }
         if tools:
             kwargs["tools"] = tools
+
+        for attempt in range(LLM_MAX_RETRIES):
+            try:
+                response = await self._client.chat.completions.create(**kwargs)
+                return self._parse_response(response)
+            except openai.RateLimitError as exc:
+                if attempt == LLM_MAX_RETRIES - 1:
+                    raise
+                wait = LLM_INITIAL_BACKOFF * (2 ** attempt)
+                logger.warning(
+                    "rate_limit_retry",
+                    attempt=attempt + 1,
+                    wait_seconds=wait,
+                    error=str(exc),
+                )
+                await asyncio.sleep(wait)
 
         response = await self._client.chat.completions.create(**kwargs)
         return self._parse_response(response)
