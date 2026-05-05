@@ -118,6 +118,9 @@ async def run_execution(
     except Exception as exc:
         logger.warning("plugin_list_prefetch_failed", error=str(exc))
 
+    connected_servers = mcp.connected_servers
+    default_server = connected_servers[0] if connected_servers else ""
+
     context = ""
     i = 0
 
@@ -126,6 +129,8 @@ async def run_execution(
         if i > 0:
             await asyncio.sleep(EXECUTION_STEP_DELAY)
         agent_name = _extract_agent_name(step)
+        if agent_name == "manual" and default_server:
+            agent_name = default_server
         purpose = step.get("purpose", "")
         hints = step.get("hints", "")
 
