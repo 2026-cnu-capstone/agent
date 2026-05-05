@@ -32,6 +32,9 @@ class ManagerState(TypedDict):
     disk_image_format: str | None
     """검증된 디스크 이미지 형식 (e01, dd, raw)"""
 
+    system_profile: str | None
+    """디스크 이미지 시스템 프로필 (OS, 호스트명, 사용자 목록 등)"""
+
     analysis_strategy: str
     """확정된 분석 전략 텍스트"""
 
@@ -61,3 +64,6 @@ class ManagerState(TypedDict):
 
     hitl_type: str
     """대기 중인 HITL 유형 (strategy | plan | result | 빈 문자열)"""
+
+    evidence_repository: Annotated[list[dict[str, Any]], operator.add]
+    """Sub-Agent별 DFXML 증거 프래그먼트 누적 저장소 (Evidence Repository)"""
