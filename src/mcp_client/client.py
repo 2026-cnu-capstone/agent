@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import AsyncExitStack
 from typing import Any
@@ -19,6 +20,7 @@ from tenacity import (
 )
 
 from config import MCPConfig, SSEServerConfig, StdioServerConfig
+from constants import CALL_TOOL_TIMEOUT
 from mcp_client.tool_cache import ToolCache
 
 logger = structlog.get_logger()
@@ -153,6 +155,9 @@ class MCPClientManager:
         Args:
             tool_key: "{server_name}__{tool_name}" 형식의 도구 키
             arguments: 도구에 전달할 인자
+
+        Raises:
+            MCPToolCallError: 도구 호출 실패 또는 타임아웃 시
         """
         server_name = self._tool_to_server.get(tool_key)
         if server_name is None:
@@ -167,8 +172,9 @@ class MCPClientManager:
         tool_name = tool_key.split("__", 1)[1]
 
         try:
-            result = await session.call_tool(
-                tool_name, arguments=arguments
+            result = await asyncio.wait_for(
+                session.call_tool(tool_name, arguments=arguments),
+                timeout=CALL_TOOL_TIMEOUT,
             )
             logger.info(
                 "tool_call_completed",
@@ -176,6 +182,10 @@ class MCPClientManager:
                 is_error=result.isError,
             )
             return result
+        except asyncio.TimeoutError as exc:
+            raise MCPToolCallError(
+                f"Tool call timed out ({CALL_TOOL_TIMEOUT}s): {tool_key}"
+            ) from exc
         except Exception as exc:
             raise MCPToolCallError(
                 f"Tool call failed: {tool_key} - {exc}"

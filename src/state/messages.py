@@ -51,6 +51,9 @@ class TaskResult(TypedDict):
     artifacts: list[dict[str, Any]]
     """추출된 구조화 아티팩트 목록"""
 
+    follow_up: dict[str, Any] | None
+    """추가 조사 요청 (None이면 불필요)"""
+
 
 class AgentMessage(TypedDict):
     """에이전트 간 일반 메시지 (감사 로그 및 상태 전달용)"""
