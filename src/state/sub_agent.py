@@ -40,3 +40,6 @@ class SubAgentState(TypedDict):
 
     result: TaskResult | None
     """Sub-Agent 실행 완료 후 최종 결과"""
+
+    dfxml_fragment: str
+    """분석 완료 후 생성된 DFXML 프래그먼트"""
