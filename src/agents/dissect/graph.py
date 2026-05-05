@@ -19,9 +19,8 @@ from agents.base import (
     sub_agent_finalize_node,
     sub_agent_llm_node,
 )
-from agents.dissect.dfxml import build_dfxml_fragment_prompt
 from agents.dissect.nodes import dissect_tool_node
-from agents.dissect.prompts import build_dissect_prompt
+from prompts.dissect import build_dfxml_fragment_prompt, build_dissect_prompt
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
 from state.sub_agent import SubAgentState

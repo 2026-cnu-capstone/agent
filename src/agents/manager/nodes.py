@@ -9,7 +9,7 @@ from typing import Any
 
 import structlog
 
-from agents.manager.prompts import build_planning_prompt, build_strategy_prompt
+from prompts.manager import build_planning_prompt, build_strategy_prompt
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
 from state.manager import ManagerState
@@ -66,8 +66,12 @@ async def planning_node(
     server_names = mcp.connected_servers
     server_list = "\n".join(f"- {name}" for name in server_names) if server_names else ""
 
+    messages = list(state["messages"])
+    if messages and messages[-1].get("role") == "assistant":
+        messages.append({"role": "user", "content": "위 전략을 바탕으로 세부 실행 계획을 수립해주세요."})
+
     response = await llm.chat(
-        messages=state["messages"],
+        messages=messages,
         tools=None,
         system=build_planning_prompt(
             state.get("analysis_strategy", ""),
@@ -176,17 +180,39 @@ def hitl_result_gate(state: ManagerState) -> dict[str, Any]:
 
 
 def _parse_plan_steps(plan_text: str) -> list[dict[str, Any]]:
-    """계획 텍스트에서 JSON 단계 목록 파싱"""
-    match = re.search(r"```json\s*(\{.*?\})\s*```", plan_text, re.DOTALL)
+    """계획 텍스트에서 JSON 단계 목록 파싱
+
+    ```json ... ``` 코드 블록에서 steps 배열을 추출.
+    중첩 중괄호를 처리하기 위해 마지막 } 기준으로 매칭.
+    JSON 블록이 없으면 빈 목록 반환.
+    """
+    match = re.search(r"```json\s*(\{[\s\S]*\})\s*```", plan_text)
     if not match:
-        logger.warning("plan_steps_json_not_found")
-        return []
+        json_start = plan_text.find('{"steps"')
+        if json_start == -1:
+            logger.warning("plan_steps_json_not_found")
+            return []
+        json_end = plan_text.rfind("}") + 1
+        raw_json = plan_text[json_start:json_end]
+    else:
+        raw_json = match.group(1)
+
     try:
-        data = json.loads(match.group(1))
+        data = json.loads(raw_json)
         return data.get("steps", [])
     except json.JSONDecodeError:
-        logger.warning("plan_steps_json_parse_failed")
-        return []
+        try:
+            repaired = raw_json.rstrip()
+            if not repaired.endswith("}"):
+                repaired += "]}"
+            elif repaired.endswith("},") or repaired.endswith("}"):
+                if '"steps"' in repaired and not repaired.rstrip().endswith("]}"):
+                    repaired = repaired.rstrip().rstrip(",") + "]}"
+            data = json.loads(repaired)
+            return data.get("steps", [])
+        except json.JSONDecodeError:
+            logger.warning("plan_steps_json_parse_failed", raw_length=len(raw_json))
+            return []
 
 
 def _extract_agent_name(step: dict[str, Any]) -> str:

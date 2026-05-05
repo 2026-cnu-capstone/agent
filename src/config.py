@@ -70,7 +70,7 @@ class LLMConfig(BaseModel):
     provider: LLMProvider = LLMProvider.ANTHROPIC
     model: str = "claude-sonnet-4-20250514"
     temperature: float = 0.0
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     base_url: str | None = None
 
 
