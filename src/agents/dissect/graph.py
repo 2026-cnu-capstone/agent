@@ -61,7 +61,6 @@ def _parse_followup(output: str) -> tuple[str, dict[str, Any] | None]:
         return output, None
 
     follow_up["suggested_step"].setdefault("name", f"추가 조사: {follow_up['reason'][:30]}")
-    follow_up["suggested_step"].setdefault("mcp_server", "dissect")
     return clean_output, follow_up
 
 
@@ -90,6 +89,10 @@ async def dissect_finalize_node(
     output = result.get("output", "")
 
     clean_output, follow_up = _parse_followup(output)
+    if follow_up:
+        follow_up["suggested_step"].setdefault(
+            "mcp_server", task.get("agent_name", "dissect")
+        )
     result["output"] = clean_output
     result["follow_up"] = follow_up
 

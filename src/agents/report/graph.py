@@ -19,7 +19,7 @@ class ReportAgentState(TypedDict):
     """Sub-Agent들의 실행 결과 목록"""
 
     evidence_repository: list[dict[str, Any]]
-    """Sub-Agent별 DFXML 증거 프래그먼트 목록 (Evidence Repository)"""
+    """Sub-Agent별 증거 산출물 목록 (artifact + format 구조)"""
 
     case_description: str
     """사건 개요 텍스트"""
