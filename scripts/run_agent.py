@@ -565,17 +565,17 @@ async def main() -> None:
         print(f"  {GREEN}이미지 등록{RESET}: {image_path} ({image_format.upper()})")
 
         system_profile = ""
-        print(f"  {DIM}시스템 프로필 추출 중...{RESET}", end="", flush=True)
+        print(f"  {DIM}타겟 열기 중...{RESET}", end="", flush=True)
         try:
             start = time.time()
-            profile_result = await mcp.call_tool(
-                "dissect__extract_system_profile",
-                {"image_path": image_path},
+            open_result = await mcp.call_tool(
+                "dissect__open_target",
+                {"path": image_path},
             )
-            system_profile = mcp.get_tool_result_text(profile_result)
-            print(f"\r  {GREEN}시스템 프로필 추출 완료{RESET} ({_elapsed(start)})")
+            system_profile = mcp.get_tool_result_text(open_result)
+            print(f"\r  {GREEN}타겟 열기 완료{RESET} ({_elapsed(start)})")
         except Exception as exc:
-            print(f"\r  {YELLOW}시스템 프로필 추출 실패: {exc}{RESET}")
+            print(f"\r  {YELLOW}타겟 열기 실패: {exc}{RESET}")
 
         while True:
             print("\n사건 개요를 입력하세요. (quit으로 종료)")
