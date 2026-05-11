@@ -51,16 +51,29 @@ async def sub_agent_llm_node(
         system=system_prompt,
     )
 
-    assistant_message: dict[str, Any] = {
-        "role": "assistant",
-        "content": response.content,
-    }
+    if isinstance(llm, AnthropicProvider):
+        content_blocks = []
+        if response.content:
+            content_blocks.append({"type": "text", "text": response.content})
+        for tc in response.tool_calls:
+            content_blocks.append({
+                "type": "tool_use",
+                "id": tc.id,
+                "name": tc.name,
+                "input": tc.arguments,
+            })
 
-    if response.tool_calls:
-        if isinstance(llm, AnthropicProvider):
-            serialized = [asdict(tc) for tc in response.tool_calls]
-        else:
-            serialized = [
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": content_blocks if content_blocks else response.content,
+        }
+    else:
+        assistant_message = {
+            "role": "assistant",
+            "content": response.content,
+        }
+        if response.tool_calls:
+            assistant_message["tool_calls"] = [
                 {
                     "id": tc.id,
                     "type": "function",
@@ -71,7 +84,8 @@ async def sub_agent_llm_node(
                 }
                 for tc in response.tool_calls
             ]
-        assistant_message["tool_calls"] = serialized
+
+    if response.tool_calls:
         return {
             "messages": [assistant_message],
             "pending_tool_calls": [asdict(tc) for tc in response.tool_calls],
