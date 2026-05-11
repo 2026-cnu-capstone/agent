@@ -39,7 +39,7 @@ class SubAgentConfig:
     Attributes:
         build_graph: 전용 subgraph 빌더 함수
         build_state: 전용 초기 상태 빌더 (None이면 범용 사용)
-        prefetch_tool: 실행 전 사전 호출할 도구 키 (예: "dissect__list_artifact_plugins")
+        prefetch_tool: 실행 전 사전 호출할 도구 키 (예: "dissect__list_plugins")
     """
 
     build_graph: GraphBuilder
@@ -145,10 +145,21 @@ class AgentRegistry:
         if config:
             return config.build_graph(llm, mcp, purpose, extra_context)
 
+        from prompts.dissect import format_tool_docs
+
+        tool_docs = ""
+        try:
+            cached = mcp._tool_cache.get_all()
+            if cached:
+                tool_docs = format_tool_docs(cached)
+        except Exception:
+            pass
+
         system_prompt = (
             f"당신은 {server_name} MCP 서버의 도구를 사용하여 "
             f"디지털 포렌식 분석을 수행하는 에이전트입니다.\n\n"
-            f"작업 목적: {purpose}"
+            f"## 사용 가능한 도구\n{tool_docs}\n\n"
+            f"## 작업 목적\n{purpose}"
         )
         return build_sub_agent_graph(llm, mcp, system_prompt)
 
@@ -192,7 +203,7 @@ def create_default_registry() -> AgentRegistry:
         SubAgentConfig(
             build_graph=_dissect_graph_adapter,
             build_state=create_dissect_state,
-            prefetch_tool="dissect__list_artifact_plugins",
+            prefetch_tool=None,
         ),
     )
 

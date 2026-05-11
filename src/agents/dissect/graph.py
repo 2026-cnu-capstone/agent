@@ -20,7 +20,7 @@ from agents.base import (
     sub_agent_llm_node,
 )
 from agents.dissect.nodes import dissect_tool_node
-from prompts.dissect import build_dfxml_fragment_prompt, build_dissect_prompt
+from prompts.dissect import build_dfxml_fragment_prompt, build_dissect_prompt, format_tool_docs
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
 from state.sub_agent import SubAgentState
@@ -139,7 +139,7 @@ def build_dissect_graph(
 
     base 팩토리와 차이점:
         - tool_node에 output summarizer가 연동된 dissect_tool_node 사용
-        - Dissect 도구 카테고리 분류 프롬프트 적용
+        - MCP 도구 스펙에서 동적 생성된 프롬프트 적용
 
     Args:
         llm: LLM 프로바이더
@@ -150,7 +150,19 @@ def build_dissect_graph(
     Returns:
         컴파일된 LangGraph subgraph
     """
-    system_prompt = build_dissect_prompt(purpose, available_plugins)
+    tool_docs = ""
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            tools = mcp._tool_cache.get_all() or {}
+        else:
+            tools = loop.run_until_complete(mcp.list_tools())
+        tool_docs = format_tool_docs(tools)
+    except Exception:
+        logger.warning("tool_docs_generation_failed")
+
+    system_prompt = build_dissect_prompt(purpose, available_plugins, tool_docs=tool_docs)
 
     graph = StateGraph(SubAgentState)
 

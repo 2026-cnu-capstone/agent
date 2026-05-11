@@ -1,58 +1,28 @@
 """Dissect Sub-Agent 프롬프트
 
-사용처:
-    - src/agents/dissect/prompts.py → build_dissect_prompt (시스템 프롬프트 조립)
-    - src/agents/dissect/graph.py → dissect_finalize_node (FOLLOWUP 마커 정의)
+도구 목록은 MCP 서버에서 동적으로 조회하여 주입.
+하드코딩된 도구명 없이 어떤 MCP 서버 구성에도 대응.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
+
 DISSECT_SYSTEM_PROMPT = """\
-당신은 Dissect 포렌식 도구를 운용하는 Sub-Agent입니다.
-할당된 작업을 수행하기 위해 아래 도구 카테고리를 참고하여 최적의 도구를 선택하세요.
+당신은 디지털 포렌식 분석 Sub-Agent입니다.
+할당된 작업을 수행하기 위해 MCP 서버가 제공하는 도구를 사용하세요.
 
-## 도구 카테고리
+## 사용 가능한 도구
+{tool_docs}
 
-### 1. 이미지/시스템 정보
-- `disk_image_info` — 디스크 이미지 메타데이터 조회 (파티션, 파일시스템, 크기)
-- `extract_system_profile` — OS 버전, 호스트명, 사용자 목록, 네트워크 정보 등 시스템 프로필 추출
-- `list_plugins` — 이미지에서 사용 가능한 Dissect 플러그인 목록 조회
-
-### 2. 레지스트리/아티팩트 분석
-- `list_artifact_plugins` — 사용 가능한 아티팩트 플러그인 목록 (amcache, prefetch, shellbags 등)
-- `run_single_plugin` — 단일 플러그인 실행 (plugin 파라미터에 정확한 플러그인 이름 필요)
-- `run_multiple_plugins` — 여러 플러그인 동시 실행
-- `run_all_artifact_plugins` — 등록된 모든 아티팩트 플러그인 일괄 실행
-
-### 3. 타임라인/이벤트 분석
-- `build_timeline` — MFT, Prefetch, EventLog 등 복합 소스에서 타임라인 구축
-- `extract_powershell_activity` — PowerShell 관련 이벤트 로그 및 의심 활동 추출
-
-### 4. 파일시스템/추출
-- `extract_file_or_directory` — 특정 파일이나 디렉터리를 이미지에서 추출
-- `extract_downloads_folder` — 사용자 Downloads 폴더 일괄 추출
-- `acquire_minimal_artifacts` — 핵심 포렌식 아티팩트 자동 수집 (레지스트리, 이벤트로그, Prefetch 등)
-
-### 5. 키워드 검색
-- `search_keyword` — 이미지 전체에서 키워드 검색
-
-## 위험 플러그인 (절대 전체 덤프 금지)
-아래 플러그인은 출력량이 수백만 행에 달해 메모리 초과를 유발합니다.
-**절대로 max_rows 없이 실행하지 마세요.**
-
-- `os.windows.regf.regf` — 전체 레지스트리 덤프. 대신 `search_keyword`로 필요한 키만 검색
-- `os.windows.log.evtx.evtx` — 전체 이벤트 로그. max_rows=100 이하로 제한하거나 `search_keyword` 사용
-- `run_all_artifact_plugins` — 모든 아티팩트 일괄 실행. max_rows_per_plugin=50 필수
-- `run_multiple_plugins` — max_rows_per_plugin=50 필수
-
-## 도구 선택 원칙
-1. 작업 목적에 해당하는 카테고리를 먼저 식별
-2. 해당 카테고리 내에서 가장 구체적인 도구를 선택
-3. 특정 값을 찾을 때는 전체 덤프 대신 `search_keyword`를 우선 사용
-4. `run_single_plugin` 사용 시 반드시 max_rows를 50~200 범위로 지정
-5. `run_single_plugin` 사용 시 반드시 `list_artifact_plugins`로 유효한 플러그인 이름을 먼저 확인
-6. 파라미터 값은 이전 단계 출력에서 추출하고, 찾을 수 없으면 null 반환
-7. 증거 무결성을 최우선으로 유지
+## 분석 원칙
+1. 디스크 이미지를 열어야 하는 도구가 있다면 반드시 먼저 이미지를 열고, 반환된 식별자를 이후 호출에 전달
+2. 대용량 출력이 예상되는 도구는 결과 행 수를 제한 (limit, max_rows 등)
+3. 레지스트리나 특정 값을 찾을 때는 전체 덤프 대신 키 경로를 지정하여 조회
+4. 파라미터 값은 이전 단계 출력에서 추출하고, 찾을 수 없으면 null 반환
+5. 증거 무결성을 최우선으로 유지
+6. 각 발견 사항에 출처(파일 경로, 레지스트리 키, 이벤트 ID 등)를 명시
 
 ## 추가 조사 판단
 분석 완료 후 아래 조건에 해당하면 응답 마지막에 추가 조사를 제안하세요:
@@ -89,16 +59,58 @@ DFXML_FRAGMENT_PROMPT = """\
 - 유효한 XML만 반환 (설명 텍스트 없이)"""
 
 
-def build_dissect_prompt(purpose: str = "", available_plugins: str = "") -> str:
-    """작업 목적을 포함한 Dissect Sub-Agent 시스템 프롬프트 생성
+def format_tool_docs(tools: dict[str, Any]) -> str:
+    """MCP 도구 스펙에서 프롬프트용 도구 문서 동적 생성
 
     Args:
-        purpose: 현재 작업의 목적 (비어있으면 기본 프롬프트만 반환)
-        available_plugins: 사전 조회된 아티팩트 플러그인 목록
+        tools: {tool_key: Tool} 딕셔너리 (mcp.list_tools() 반환값)
+
+    Returns:
+        도구 이름, 설명, 필수 파라미터를 포함한 문서 텍스트
     """
-    parts = [DISSECT_SYSTEM_PROMPT]
+    if not tools:
+        return "(사용 가능한 도구 없음)"
+
+    lines = []
+    for name, tool in sorted(tools.items()):
+        short_name = name.split("__", 1)[-1] if "__" in name else name
+        desc = (tool.description or "").split("\n")[0].strip()[:120]
+        schema = tool.inputSchema if hasattr(tool, "inputSchema") else {}
+        required = schema.get("required", [])
+        props = schema.get("properties", {})
+
+        param_parts = []
+        for p in required:
+            p_type = props.get(p, {}).get("type", "")
+            param_parts.append(f"{p}: {p_type}" if p_type else p)
+        param_str = f" ({', '.join(param_parts)})" if param_parts else ""
+
+        lines.append(f"- `{short_name}`{param_str} — {desc}")
+
+    return "\n".join(lines)
+
+
+def build_dissect_prompt(
+    purpose: str = "",
+    available_plugins: str = "",
+    tool_docs: str = "",
+) -> str:
+    """작업 목적과 도구 문서를 포함한 Sub-Agent 시스템 프롬프트 생성
+
+    Args:
+        purpose: 현재 작업의 목적
+        available_plugins: 사전 조회된 플러그인 목록
+        tool_docs: format_tool_docs()로 생성된 도구 문서
+    """
+    prompt = DISSECT_SYSTEM_PROMPT.format(
+        tool_docs=tool_docs or "(도구 목록은 function calling 스펙을 참조하세요)"
+    )
+
+    parts = [prompt]
     if available_plugins:
-        parts.append(f"## 사용 가능한 아티팩트 플러그인 (사전 조회 완료 — list_artifact_plugins 호출 불필요)\n{available_plugins}")
+        parts.append(
+            f"## 사용 가능한 플러그인 (사전 조회 완료)\n{available_plugins}"
+        )
     if purpose:
         parts.append(f"## 현재 작업 목적\n{purpose}")
     return "\n\n".join(parts)
