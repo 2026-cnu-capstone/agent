@@ -24,7 +24,7 @@ CHUNK_THRESHOLD: int = 20000
 CALL_TOOL_TIMEOUT: int = 300
 """MCP 도구 호출 타임아웃 (초)"""
 
-EXECUTION_STEP_DELAY: int = 5
+EXECUTION_STEP_DELAY: int = 60
 """Sub-Agent 실행 단계 간 대기 시간 (초)"""
 
 LLM_MAX_RETRIES: int = 5
