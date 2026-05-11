@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, Text, func
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
@@ -38,3 +38,75 @@ class Case(Base):
     def __repr__(self) -> str:
         """케이스 문자열 표현"""
         return f"<Case(id={self.id}, format={self.disk_image_format})>"
+
+
+class AgentRun(Base):
+    """에이전트 실행 이력
+
+    Attributes:
+        id: 실행 고유 식별자 (자동 증가)
+        case_id: 연관 케이스 ID (FK)
+        agent_name: 실행된 에이전트 이름 (예: dissect, report)
+        status: 실행 상태 (running, success, error)
+        started_at: 실행 시작 시각
+        finished_at: 실행 종료 시각
+    """
+
+    __tablename__ = "agent_run"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    case_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("agent.id"), nullable=False
+    )
+    agent_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="running"
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    step_results: Mapped[list["StepResult"]] = relationship(
+        back_populates="agent_run", cascade="all, delete-orphan"
+    )
+
+    def __repr__(self) -> str:
+        """에이전트 실행 문자열 표현"""
+        return f"<AgentRun(id={self.id}, agent={self.agent_name}, status={self.status})>"
+
+
+class StepResult(Base):
+    """단계별 실행 결과
+
+    Attributes:
+        id: 결과 고유 식별자 (자동 증가)
+        agent_run_id: 연관 AgentRun ID (FK)
+        step_index: 실행 단계 인덱스
+        tool_name: 사용된 MCP 도구 이름
+        output_summary: 요약된 출력 (summarizer 적용 후)
+        raw_output: 원본 전체 출력
+        created_at: 결과 저장 시각
+    """
+
+    __tablename__ = "step_result"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    agent_run_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("agent_run.id"), nullable=False
+    )
+    step_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    output_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    raw_output: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    agent_run: Mapped["AgentRun"] = relationship(back_populates="step_results")
+
+    def __repr__(self) -> str:
+        """단계 결과 문자열 표현"""
+        return f"<StepResult(id={self.id}, step={self.step_index}, tool={self.tool_name})>"
