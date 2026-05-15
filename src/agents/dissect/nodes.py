@@ -23,30 +23,31 @@ HEAVY_PLUGINS = {
 }
 
 METADATA_TOOLS = {
+    "dissect__list_artifact_plugins",
     "dissect__list_plugins",
-    "dissect__list_targets",
-    "dissect__open_target",
-    "dissect__close_target",
 }
 
 
-def _enforce_limit(tool_name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
-    """query_plugin 호출 시 대용량 플러그인에 limit 기본값 강제 주입
+def _enforce_max_rows(tool_name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    """대용량 플러그인 호출 시 max_rows 기본값 강제 주입
 
     Args:
         tool_name: MCP 도구 키
         arguments: 도구 호출 인자
     """
     args = dict(arguments) if arguments else {}
-    plugin_name = args.get("plugin_name", "")
+    plugin = args.get("plugin", "")
 
-    if "query_plugin" in tool_name:
-        if plugin_name in HEAVY_PLUGINS and not args.get("limit"):
-            args["limit"] = DEFAULT_MAX_ROWS
-            logger.info("limit_enforced", tool=tool_name, plugin=plugin_name, limit=DEFAULT_MAX_ROWS)
-        elif not args.get("limit"):
-            args["limit"] = DEFAULT_MAX_ROWS
-            logger.info("limit_enforced", tool=tool_name, limit=DEFAULT_MAX_ROWS)
+    if "run_all_artifact_plugins" in tool_name or "run_multiple_plugins" in tool_name:
+        if not args.get("max_rows_per_plugin"):
+            args["max_rows_per_plugin"] = MAX_ROWS_PER_PLUGIN
+            logger.info("max_rows_enforced", tool=tool_name, max_rows_per_plugin=MAX_ROWS_PER_PLUGIN)
+        return args
+
+    if plugin in HEAVY_PLUGINS or "run_single_plugin" in tool_name:
+        if not args.get("max_rows"):
+            args["max_rows"] = DEFAULT_MAX_ROWS
+            logger.info("max_rows_enforced", tool=tool_name, plugin=plugin, max_rows=DEFAULT_MAX_ROWS)
 
     return args
 
@@ -75,7 +76,7 @@ async def dissect_tool_node(
 
     for tc in state["pending_tool_calls"]:
         try:
-            safe_args = _enforce_limit(tc["name"], tc.get("arguments"))
+            safe_args = _enforce_max_rows(tc["name"], tc.get("arguments"))
             call_result = await mcp.call_tool(tc["name"], safe_args)
             raw_content = mcp.get_tool_result_text(call_result)
             is_error = bool(call_result.isError)

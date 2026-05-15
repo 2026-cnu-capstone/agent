@@ -8,17 +8,12 @@
 from __future__ import annotations
 
 
-def build_strategy_prompt(
-    disk_image_format: str = "",
-    system_profile: str = "",
-    rag_context: str = "",
-) -> str:
+def build_strategy_prompt(disk_image_format: str = "", system_profile: str = "") -> str:
     """사건 정보를 바탕으로 조사할 아티팩트 목록 도출
 
     Args:
         disk_image_format: 디스크 이미지 형식 (e01, dd 등)
         system_profile: 시스템 프로필 정보 (OS, 호스트명 등)
-        rag_context: RAG로 검색된 유사 사례 전략 텍스트
     """
     context_parts = []
     if disk_image_format:
@@ -27,21 +22,12 @@ def build_strategy_prompt(
         context_parts.append(f"시스템 정보:\n{system_profile}")
     context_block = "\n".join(context_parts)
 
-    rag_section = ""
-    if rag_context:
-        rag_section = f"""
-[유사 사건 조사 경험 (참고용)]
-아래는 과거 유사 사건에서 사용된 조사 전략입니다. 참고하되 현재 사건에 맞게 판단하세요.
-
-{rag_context}
-"""
-
     return f"""당신은 디지털 포렌식 분석 전문가 AI입니다.
 
 사용자가 제공한 사건 정보를 바탕으로, 이 사건에서 조사해야 할 아티팩트 목록만 작성하세요.
 설명이나 분석 방법은 쓰지 말고, 아티팩트 이름과 조사 이유를 한 줄씩 나열하세요.
 
-{f"[디스크 이미지 정보]{chr(10)}{context_block}{chr(10)}" if context_block else ""}{rag_section}출력 형식 (이 형식만 사용):
+{f"[디스크 이미지 정보]{chr(10)}{context_block}{chr(10)}" if context_block else ""}출력 형식 (이 형식만 사용):
 
 ## 조사 대상 아티팩트
 - [아티팩트명]: [조사 이유 한 줄]
@@ -57,11 +43,7 @@ def build_strategy_prompt(
 사건과 관련된 아티팩트만 선별하고, 불필요한 항목은 포함하지 마세요."""
 
 
-def build_planning_prompt(
-    strategy: str,
-    mcp_servers: str = "",
-    rag_context: str = "",
-) -> str:
+def build_planning_prompt(strategy: str, mcp_servers: str = "") -> str:
     """수립된 전략을 바탕으로 세부 실행 계획 수립 프롬프트
 
     각 단계에서 어떤 MCP 서버(= Sub-Agent)를 사용할지만 지정.
@@ -70,15 +52,7 @@ def build_planning_prompt(
     Args:
         strategy: strategy_node가 수립한 분석 전략 텍스트
         mcp_servers: 사용 가능한 MCP 서버 목록 문자열
-        rag_context: RAG로 검색된 유사 사례 실행 계획 텍스트
     """
-    rag_section = ""
-    if rag_context:
-        rag_section = f"""
-[유사 사건의 실행 계획 참고]
-{rag_context}
-"""
-
     return f"""당신은 디지털 포렌식 분석 전문가 AI입니다.
 
 아래 조사 대상 아티팩트 목록을 바탕으로 단계별 실행 계획을 작성하세요.
@@ -90,7 +64,7 @@ def build_planning_prompt(
 
 [사용 가능한 MCP 서버]
 {mcp_servers if mcp_servers else "(연결된 서버 없음)"}
-{rag_section}
+
 ---
 
 **가장 먼저** 아래 JSON을 코드 블록으로 출력하세요. (상세 설명보다 반드시 앞에 위치)
