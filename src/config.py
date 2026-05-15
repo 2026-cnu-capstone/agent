@@ -74,6 +74,22 @@ class LLMConfig(BaseModel):
     base_url: str | None = None
 
 
+class RAGConfig(BaseModel):
+    """RAG 벡터스토어 설정
+
+    Attributes:
+        enabled: RAG 기능 활성화 여부
+        embedding_model: 임베딩 모델명 (HuggingFace 모델 ID)
+        search_top_k: 검색 시 반환할 최대 결과 수
+        similarity_threshold: 유사도 필터 임계값 (0.0~1.0)
+    """
+
+    enabled: bool = False
+    embedding_model: str = "BAAI/bge-m3"
+    search_top_k: int = 3
+    similarity_threshold: float = 0.5
+
+
 class Settings(BaseSettings):
     """애플리케이션 전체 설정
 
@@ -90,11 +106,13 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        env_nested_delimiter="__",
         extra="ignore",
     )
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
+    rag: RAGConfig = Field(default_factory=RAGConfig)
 
     llm_api_key: str = ""
     llm_model: str = ""
