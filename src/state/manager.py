@@ -67,3 +67,6 @@ class ManagerState(TypedDict):
 
     evidence_repository: Annotated[list[dict[str, Any]], operator.add]
     """Sub-Agent별 증거 산출물 누적 저장소 (artifact + format 구조)"""
+
+    rag_context: str
+    """RAG 검색 결과 텍스트 (전략/계획 수립 시 프롬프트에 주입)"""
