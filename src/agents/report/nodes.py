@@ -90,11 +90,7 @@ async def dfxml_node(
         llm: LLM 프로바이더
     """
     evidence_repo = state.get("evidence_repository", [])
-    fragments = [
-        e.get("artifact") or e.get("dfxml_fragment", "")
-        for e in evidence_repo
-        if e.get("artifact") or e.get("dfxml_fragment")
-    ]
+    fragments = [e["dfxml_fragment"] for e in evidence_repo if e.get("dfxml_fragment")]
 
     if fragments:
         response = await llm.chat(
