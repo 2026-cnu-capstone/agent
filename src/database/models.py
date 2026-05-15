@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -110,3 +111,38 @@ class StepResult(Base):
     def __repr__(self) -> str:
         """단계 결과 문자열 표현"""
         return f"<StepResult(id={self.id}, step={self.step_index}, tool={self.tool_name})>"
+
+
+EMBEDDING_DIMENSION = 1024
+
+
+class CaseEmbedding(Base):
+    """케이스 분석 결과 임베딩 (pgvector)
+
+    과거 분석 사례를 벡터로 저장하여 유사 케이스 RAG 검색에 사용
+
+    Attributes:
+        id: 임베딩 고유 식별자 (자동 증가)
+        case_id: 연관 케이스 ID (FK)
+        phase: 분석 단계 (strategy, planning, execution)
+        content: 임베딩된 원본 텍스트
+        embedding: pgvector 벡터 (1024차원, BGE-M3)
+        created_at: 생성 시각
+    """
+
+    __tablename__ = "case_embedding"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    case_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("agent.id"), nullable=True
+    )
+    phase: Mapped[str] = mapped_column(String(20), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding = mapped_column(Vector(EMBEDDING_DIMENSION), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    def __repr__(self) -> str:
+        """케이스 임베딩 문자열 표현"""
+        return f"<CaseEmbedding(id={self.id}, case_id={self.case_id}, phase={self.phase})>"
