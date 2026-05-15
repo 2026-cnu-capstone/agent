@@ -66,7 +66,4 @@ class ManagerState(TypedDict):
     """대기 중인 HITL 유형 (strategy | plan | result | 빈 문자열)"""
 
     evidence_repository: Annotated[list[dict[str, Any]], operator.add]
-    """Sub-Agent별 증거 산출물 누적 저장소 (artifact + format 구조)"""
-
-    rag_context: str
-    """RAG 검색 결과 텍스트 (전략/계획 수립 시 프롬프트에 주입)"""
+    """Sub-Agent별 DFXML 증거 프래그먼트 누적 저장소 (Evidence Repository)"""
