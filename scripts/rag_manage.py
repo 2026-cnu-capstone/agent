@@ -275,7 +275,8 @@ async def cmd_delete_all(engine) -> None:
 
 async def main() -> None:
     """메인 루프"""
-    settings = load_settings()
+    config_path = Path(__file__).parent.parent / "config" / "mcp_servers.json"
+    settings = load_settings(config_path)
     engine = get_engine(settings.database_url)
     await init_db(engine)
 
