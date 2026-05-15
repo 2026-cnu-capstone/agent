@@ -20,7 +20,7 @@ from agents.base import (
     sub_agent_llm_node,
 )
 from agents.dissect.nodes import dissect_tool_node
-from prompts.dissect import build_dfxml_fragment_prompt, build_dissect_prompt, format_tool_docs
+from prompts.dissect import build_dfxml_fragment_prompt, build_dissect_prompt
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
 from state.sub_agent import SubAgentState
@@ -61,6 +61,7 @@ def _parse_followup(output: str) -> tuple[str, dict[str, Any] | None]:
         return output, None
 
     follow_up["suggested_step"].setdefault("name", f"추가 조사: {follow_up['reason'][:30]}")
+    follow_up["suggested_step"].setdefault("mcp_server", "dissect")
     return clean_output, follow_up
 
 
@@ -89,10 +90,6 @@ async def dissect_finalize_node(
     output = result.get("output", "")
 
     clean_output, follow_up = _parse_followup(output)
-    if follow_up:
-        follow_up["suggested_step"].setdefault(
-            "mcp_server", task.get("agent_name", "dissect")
-        )
     result["output"] = clean_output
     result["follow_up"] = follow_up
 
@@ -139,7 +136,7 @@ def build_dissect_graph(
 
     base 팩토리와 차이점:
         - tool_node에 output summarizer가 연동된 dissect_tool_node 사용
-        - MCP 도구 스펙에서 동적 생성된 프롬프트 적용
+        - Dissect 도구 카테고리 분류 프롬프트 적용
 
     Args:
         llm: LLM 프로바이더
@@ -150,19 +147,7 @@ def build_dissect_graph(
     Returns:
         컴파일된 LangGraph subgraph
     """
-    tool_docs = ""
-    try:
-        import asyncio
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            tools = mcp._tool_cache.get_all() or {}
-        else:
-            tools = loop.run_until_complete(mcp.list_tools())
-        tool_docs = format_tool_docs(tools)
-    except Exception:
-        logger.warning("tool_docs_generation_failed")
-
-    system_prompt = build_dissect_prompt(purpose, available_plugins, tool_docs=tool_docs)
+    system_prompt = build_dissect_prompt(purpose, available_plugins)
 
     graph = StateGraph(SubAgentState)
 
