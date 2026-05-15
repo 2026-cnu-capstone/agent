@@ -22,6 +22,7 @@ from agents.manager.nodes import (
 from agents.report.graph import build_report_graph, create_report_state
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
+from rag.service import RAGService
 from state.manager import ManagerState
 from state.messages import TaskAssignment, TaskResult
 
@@ -47,18 +48,22 @@ class ExecutionCallback(Protocol):
 async def run_strategy(
     state: ManagerState,
     llm: BaseLLMProvider,
+    rag_service: RAGService | None = None,
 ) -> ManagerState:
     """전략 수립 단계 실행
 
     Args:
         state: Manager 상태 (system_profile 포함)
         llm: LLM 프로바이더
+        rag_service: RAG 서비스 (None이면 RAG 비활성)
 
     Returns:
         analysis_strategy가 채워진 상태
     """
     system_profile = state.get("system_profile") or ""
-    updates = await strategy_node(state, llm=llm, system_profile=system_profile)
+    updates = await strategy_node(
+        state, llm=llm, system_profile=system_profile, rag_service=rag_service
+    )
     return {**state, **updates}
 
 
@@ -66,6 +71,7 @@ async def run_planning(
     state: ManagerState,
     llm: BaseLLMProvider,
     mcp: MCPClientManager,
+    rag_service: RAGService | None = None,
 ) -> ManagerState:
     """계획 수립 단계 실행
 
@@ -73,11 +79,12 @@ async def run_planning(
         state: 전략이 확정된 Manager 상태
         llm: LLM 프로바이더
         mcp: MCP 클라이언트 매니저
+        rag_service: RAG 서비스 (None이면 RAG 비활성)
 
     Returns:
         plan_steps가 채워진 상태
     """
-    updates = await planning_node(state, llm=llm, mcp=mcp)
+    updates = await planning_node(state, llm=llm, mcp=mcp, rag_service=rag_service)
     return {**state, **updates}
 
 
@@ -87,11 +94,13 @@ async def run_execution(
     mcp: MCPClientManager,
     callback: ExecutionCallback | None = None,
     registry: AgentRegistry | None = None,
+    rag_service: RAGService | None = None,
 ) -> ManagerState:
     """Sub-Agent 실행 단계
 
     plan_steps의 각 단계를 순차적으로 Sub-Agent에 동적 dispatch하고 결과 수집.
     AgentRegistry를 통해 MCP 서버명 기반으로 전용/범용 에이전트를 자동 선택.
+    실행 완료 후 RAG 서비스가 활성화되어 있으면 결과를 벡터 저장소에 저장.
 
     Args:
         state: 계획이 확정된 Manager 상태
@@ -99,6 +108,7 @@ async def run_execution(
         mcp: MCP 클라이언트 매니저
         callback: 진행 상황 콜백 (None이면 무시)
         registry: Sub-Agent 레지스트리 (None이면 기본 레지스트리 사용)
+        rag_service: RAG 서비스 (None이면 결과 저장 건너뜀)
 
     Returns:
         task_results가 채워진 상태
@@ -249,6 +259,26 @@ async def run_execution(
 
         i += 1
 
+    if rag_service and state.get("case_id"):
+        results_summary = "\n".join(
+            f"[{r.get('agent_name', '')}] {r.get('output', '')[:300]}"
+            for r in results
+            if r.get("status") == "success"
+        )
+        case_description = ""
+        if state.get("messages"):
+            case_description = state["messages"][0].get("content", "")
+        try:
+            await rag_service.store_case_result(
+                case_id=state["case_id"],
+                strategy=state.get("analysis_strategy", ""),
+                plan=state.get("analysis_plan", ""),
+                results_summary=results_summary,
+                case_description=case_description,
+            )
+        except Exception as exc:
+            logger.warning("rag_store_failed", error=str(exc))
+
     return {
         **state,
         "task_results": results,
@@ -323,4 +353,5 @@ def create_manager_state(
         hitl_pending=False,
         hitl_type="",
         evidence_repository=[],
+        rag_context="",
     )
