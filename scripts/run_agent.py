@@ -46,6 +46,9 @@ from llm_provider.anthropic import AnthropicProvider
 from llm_provider.base import BaseLLMProvider
 from llm_provider.openai import OpenAIProvider
 from mcp_client.client import MCPClientManager
+from rag.embedding import Embedder
+from rag.pgvector_store import PgVectorStore
+from rag.service import RAGService
 
 
 DIM = "\033[2m"
@@ -349,7 +352,7 @@ def save_report(
     return docx_path, dfxml_path
 
 
-async def run_strategy_hitl(state, llm) -> dict:
+async def run_strategy_hitl(state, llm, rag_service=None) -> dict:
     """전략 수립 HITL 루프
 
     LLM이 전략을 생성하고 사용자가 승인/수정할 때까지 반복
@@ -360,8 +363,12 @@ async def run_strategy_hitl(state, llm) -> dict:
     while True:
         start = time.time()
         print(f"  {DIM}LLM 호출 중...{RESET}", end="", flush=True)
-        current = await run_strategy(current, llm)
+        current = await run_strategy(current, llm, rag_service=rag_service)
         print(f"\r  {GREEN}전략 생성 완료{RESET} ({_elapsed(start)})")
+
+        rag_ctx = current.get("rag_context", "")
+        if rag_ctx:
+            print(f"\n  {BLUE}[RAG] 유사 사례 컨텍스트가 프롬프트에 주입됨 ({len(rag_ctx)}자){RESET}")
 
         strategy = current.get("analysis_strategy", "")
         print_section("분석 전략 (조사 대상 아티팩트)", strategy)
@@ -390,7 +397,7 @@ async def run_strategy_hitl(state, llm) -> dict:
         print(f"  {DIM}전략 재수립 중...{RESET}")
 
 
-async def run_planning_hitl(state, llm, mcp) -> dict:
+async def run_planning_hitl(state, llm, mcp, rag_service=None) -> dict:
     """계획 수립 HITL 루프
 
     LLM이 계획을 생성하고 사용자가 승인/수정할 때까지 반복
@@ -401,8 +408,12 @@ async def run_planning_hitl(state, llm, mcp) -> dict:
     while True:
         start = time.time()
         print(f"  {DIM}LLM 호출 중...{RESET}", end="", flush=True)
-        current = await run_planning(current, llm, mcp)
+        current = await run_planning(current, llm, mcp, rag_service=rag_service)
         print(f"\r  {GREEN}계획 생성 완료{RESET} ({_elapsed(start)})")
+
+        rag_ctx = current.get("rag_context", "")
+        if rag_ctx:
+            print(f"\n  {BLUE}[RAG] 유사 사례 컨텍스트가 프롬프트에 주입됨 ({len(rag_ctx)}자){RESET}")
 
         plan = current.get("analysis_plan", "")
         steps = current.get("plan_steps", [])
@@ -548,6 +559,19 @@ async def main() -> None:
     await init_db(db_engine)
     print(f"  {BOLD}DB{RESET}:   초기화 완료")
 
+    rag_service = None
+    if settings.rag.enabled:
+        print(f"  {DIM}RAG 임베딩 모델 로드 중...{RESET}", end="", flush=True)
+        embedder = Embedder(model_name=settings.rag.embedding_model)
+        store = PgVectorStore(engine=db_engine, embedder=embedder)
+        await store.ensure_extension()
+        rag_service = RAGService(
+            store=store,
+            top_k=settings.rag.search_top_k,
+            similarity_threshold=settings.rag.similarity_threshold,
+        )
+        print(f"\r  {GREEN}RAG 초기화 완료{RESET} (모델: {settings.rag.embedding_model})")
+
     llm = create_llm_provider(settings, api_choice)
 
     async with MCPClientManager(settings.mcp) as mcp:
@@ -600,7 +624,7 @@ async def main() -> None:
                     print(f"[Cache] 전략 캐시 적용 ({cache_key})")
                     print_section("분석 전략 (캐시)", state.get("analysis_strategy", ""))
                 else:
-                    state = await run_strategy_hitl(state, llm)
+                    state = await run_strategy_hitl(state, llm, rag_service=rag_service)
                     if cache_key:
                         _save_cache(cache_key, "strategy", {
                             "analysis_strategy": state.get("analysis_strategy", ""),
@@ -620,7 +644,7 @@ async def main() -> None:
                         print(f"  → 파싱된 실행 단계: {len(state.get('plan_steps', []))}개")
                         cache_key = ""
                     else:
-                        state = await run_planning_hitl(state, llm, mcp)
+                        state = await run_planning_hitl(state, llm, mcp, rag_service=rag_service)
                         if cache_key:
                             _save_cache(cache_key, "planning", {
                                 "analysis_plan": state.get("analysis_plan", ""),
@@ -636,7 +660,7 @@ async def main() -> None:
 
                     exec_start = time.time()
                     cb = ConsoleExecutionCallback()
-                    state = await run_execution(state, llm, mcp, callback=cb)
+                    state = await run_execution(state, llm, mcp, callback=cb, rag_service=rag_service)
 
                     task_results = state.get("task_results", [])
                     accumulated_results.extend(task_results)
