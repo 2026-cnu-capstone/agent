@@ -1,4 +1,9 @@
-"""시스템 프롬프트 빌더 (포렌식 도메인)"""
+"""시스템 프롬프트 빌더 (포렌식 도메인)
+
+Note: build_strategy_prompt, build_planning_prompt는 agents.manager.prompts로,
+      build_summary_prompt, build_report_prompt는 agents.report.prompts로 이전됨.
+      하위 호환을 위해 기존 함수는 유지하되 새 코드에서는 새 경로를 사용할 것.
+"""
 
 from __future__ import annotations
 
@@ -80,7 +85,8 @@ def build_planning_prompt(strategy: str, tool_summaries: str = "") -> str:
 
 도구가 없는 단계는 MCP 도구란에 "(없음 - 수동)"으로 표기하세요.
 
-마지막으로 아래 JSON을 반드시 코드 블록 안에 포함하세요:
+마지막으로 아래 JSON을 반드시 코드 블록 안에 포함하세요.
+**위 계획의 모든 단계를 steps 배열에 빠짐없이 포함해야 합니다. 일부만 넣으면 나머지 단계가 실행되지 않습니다.**
 
 ```json
 {{
@@ -94,7 +100,16 @@ def build_planning_prompt(strategy: str, tool_summaries: str = "") -> str:
         "필드명": "이 단계 실행 후 다음 단계에서 사용할 값 설명"
       }},
       "input_hint": "이전 단계의 output_hint 중 어떤 필드를 이 도구의 어떤 파라미터로 넘길지"
-    }}
+    }},
+    {{
+      "index": 2,
+      "name": "단계명",
+      "tool": "사용할_MCP_도구명 또는 none",
+      "purpose": "목적 한 줄",
+      "output_hint": {{}},
+      "input_hint": "없음"
+    }},
+    {{ "...모든 단계를 끝까지 포함..." }}
   ]
 }}
 ```"""
@@ -120,18 +135,26 @@ def build_step_mapper_prompt(
         disk_image_path: 분석 대상 디스크 이미지 경로
         validation_error: 직전 시도 검증 실패 메시지 (재시도 시 전달)
     """
+    _MAX_PREV_OUTPUT_CHARS = 2000
+
+    def _truncate(text: str) -> str:
+        """프롬프트에 포함할 이전 단계 출력 축약"""
+        if len(text) <= _MAX_PREV_OUTPUT_CHARS:
+            return text
+        return text[:_MAX_PREV_OUTPUT_CHARS] + f"\n...(이하 생략, 총 {len(text)}자)"
+
     # 이전 단계 output_hint + 실제 출력을 함께 구성
     if previous_steps and previous_results:
         prev_section = "\n\n".join(
             f"[{r['step']}단계 - {r['name']}]\n"
             f"output_hint: {previous_steps[i].get('output_hint', {})}\n"
-            f"실제 출력:\n{r['output']}"
+            f"실제 출력:\n{_truncate(r['output'])}"
             for i, r in enumerate(previous_results)
             if i < len(previous_steps)
         )
     elif previous_results:
         prev_section = "\n\n".join(
-            f"[{r['step']}단계 - {r['name']}]\n실제 출력:\n{r['output']}"
+            f"[{r['step']}단계 - {r['name']}]\n실제 출력:\n{_truncate(r['output'])}"
             for r in previous_results
         )
     else:
@@ -162,9 +185,10 @@ def build_step_mapper_prompt(
 
 추출 규칙:
 1. path / image_path 등 이미지 경로 파라미터 → 반드시 위의 디스크 이미지 경로 사용
-2. 나머지 파라미터 → 이전 단계 Raw 출력과 input_hint를 참고하여 실제 값 추출
+2. 나머지 파라미터 → 이전 단계 Raw 출력과 input_hint에 실제로 등장한 값만 사용
 3. schema의 required 필드는 반드시 포함
 4. 값을 찾을 수 없는 선택 파라미터는 생략
+5. 이전 단계 출력에서 값을 찾을 수 없는 경우 절대 추측하거나 임의로 만들지 말고 null을 반환
 
 설명 없이 JSON 객체만 출력합니다.
 예시: {{"path": "/image.dd", "log_path": "C:/Windows/System32/winevt/Logs/Security.evtx"}}"""
