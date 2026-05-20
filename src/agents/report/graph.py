@@ -34,7 +34,10 @@ class ReportAgentState(TypedDict):
     """생성된 보고서 텍스트"""
 
     dfxml: str
-    """생성된 DFXML XML 문자열"""
+    """생성된 통합 DFXML XML 문자열"""
+
+    dfxml_fragments: dict[str, str]
+    """step별 개별 DFXML 프래그먼트 {task_id: dfxml_xml}"""
 
 
 def build_report_graph(llm: BaseLLMProvider) -> Any:
@@ -85,4 +88,5 @@ def create_report_state(
         summary="",
         report="",
         dfxml="",
+        dfxml_fragments={},
     )

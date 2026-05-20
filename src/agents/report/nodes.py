@@ -6,13 +6,13 @@ from typing import Any
 
 import structlog
 
+from llm_provider.base import BaseLLMProvider
 from prompts.report import (
     build_dfxml_merge_prompt,
     build_dfxml_prompt,
     build_report_prompt,
     build_summary_prompt,
 )
-from llm_provider.base import BaseLLMProvider
 
 logger = structlog.get_logger()
 
@@ -82,31 +82,79 @@ async def dfxml_node(
 ) -> dict[str, Any]:
     """분석 결과를 DFXML 스키마로 변환
 
-    Evidence Repository에 프래그먼트가 있으면 병합,
-    없으면 task_results에서 전체 생성 (폴백)
+    step별 개별 DFXML 프래그먼트를 생성한 뒤 통합 DFXML로 병합.
+    Evidence Repository에 기존 프래그먼트가 있으면 재사용.
 
     Args:
         state: Report Agent 상태 (task_results, evidence_repository 포함)
         llm: LLM 프로바이더
     """
+    task_results = state.get("task_results", [])
     evidence_repo = state.get("evidence_repository", [])
-    fragments = [e["dfxml_fragment"] for e in evidence_repo if e.get("dfxml_fragment")]
 
-    if fragments:
+    existing_fragments = {
+        e.get("task_id", ""): e["dfxml_fragment"]
+        for e in evidence_repo
+        if e.get("dfxml_fragment")
+    }
+
+    dfxml_fragments: dict[str, str] = {}
+
+    for result in task_results:
+        task_id = result.get("task_id", "")
+        if not task_id:
+            continue
+
+        if task_id in existing_fragments:
+            dfxml_fragments[task_id] = existing_fragments[task_id]
+            continue
+
+        if result.get("status") == "error":
+            continue
+
+        step_result = [result]
         response = await llm.chat(
-            messages=[{"role": "user", "content": "DFXML 프래그먼트를 병합해주세요."}],
+            messages=[
+                {"role": "user", "content": "이 단계의 결과를 DFXML로 변환해주세요."},
+            ],
             tools=None,
-            system=build_dfxml_merge_prompt(fragments),
+            system=build_dfxml_prompt(step_result),
         )
-    else:
-        task_results = state.get("task_results", [])
+        fragment = response.content if isinstance(response.content, str) else ""
+        if fragment:
+            dfxml_fragments[task_id] = fragment
+
+    logger.info(
+        "dfxml_fragments_generated",
+        total=len(dfxml_fragments),
+        reused=len(existing_fragments),
+    )
+
+    fragment_list = list(dfxml_fragments.values())
+    if len(fragment_list) > 1:
         response = await llm.chat(
-            messages=[{"role": "user", "content": "분석 결과를 DFXML로 변환해주세요."}],
+            messages=[
+                {"role": "user", "content": "DFXML 프래그먼트를 병합해주세요."},
+            ],
+            tools=None,
+            system=build_dfxml_merge_prompt(fragment_list),
+        )
+        merged_dfxml = response.content if isinstance(response.content, str) else ""
+    elif len(fragment_list) == 1:
+        merged_dfxml = fragment_list[0]
+    else:
+        response = await llm.chat(
+            messages=[
+                {"role": "user", "content": "분석 결과를 DFXML로 변환해주세요."},
+            ],
             tools=None,
             system=build_dfxml_prompt(task_results),
         )
+        merged_dfxml = response.content if isinstance(response.content, str) else ""
 
-    dfxml = response.content if isinstance(response.content, str) else ""
-    logger.info("dfxml_generated", length=len(dfxml), from_fragments=bool(fragments))
+    logger.info("dfxml_merged", length=len(merged_dfxml))
 
-    return {"dfxml": dfxml}
+    return {
+        "dfxml": merged_dfxml,
+        "dfxml_fragments": dfxml_fragments,
+    }

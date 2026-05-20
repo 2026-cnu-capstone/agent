@@ -6,20 +6,18 @@ HITL 게이트는 run_agent.py에서 명시적으로 제어하므로,
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import structlog
 
 from agents.dissect.graph import build_dissect_graph, create_dissect_state
-from constants import EXECUTION_STEP_DELAY, MAX_FOLLOWUP_STEPS
 from agents.manager.nodes import (
     _extract_agent_name,
-    _parse_plan_steps,
-    strategy_node,
     planning_node,
+    strategy_node,
 )
 from agents.report.graph import build_report_graph, create_report_state
+from constants import EXECUTION_STEP_DELAY, MAX_FOLLOWUP_STEPS
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
 from state.manager import ManagerState
@@ -245,7 +243,7 @@ async def run_execution(
 async def run_report(
     state: ManagerState,
     llm: BaseLLMProvider,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Report Agent 실행
 
     Args:
@@ -253,7 +251,7 @@ async def run_report(
         llm: LLM 프로바이더
 
     Returns:
-        {"summary": ..., "report": ..., "dfxml": ...}
+        summary, report, dfxml(통합), dfxml_fragments(step별) 포함 딕셔너리
     """
     task_results = state.get("task_results", [])
     case_description = ""
@@ -273,6 +271,7 @@ async def run_report(
         "summary": result.get("summary", ""),
         "report": result.get("report", ""),
         "dfxml": result.get("dfxml", ""),
+        "dfxml_fragments": result.get("dfxml_fragments", {}),
     }
 
 
