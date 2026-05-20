@@ -18,6 +18,8 @@ from agents.manager.nodes import (
 )
 from agents.report.graph import build_report_graph, create_report_state
 from constants import EXECUTION_STEP_DELAY, MAX_FOLLOWUP_STEPS
+from database.engine import get_session
+from database.repository import create_agent_run, create_step_result, update_agent_run
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
 from node_graph import (
@@ -116,6 +118,7 @@ async def run_execution(
     registry: AgentRegistry | None = None,
     rag_service: RAGService | None = None,
     light_llm: BaseLLMProvider | None = None,
+    db_engine: Any | None = None,
 ) -> ManagerState:
     """Sub-Agent 실행 단계
 
@@ -131,6 +134,7 @@ async def run_execution(
         registry: Sub-Agent 레지스트리 (None이면 기본 레지스트리 사용)
         rag_service: RAG 서비스 (None이면 결과 저장 건너뜀)
         light_llm: 요약 등 단순 작업에 사용할 경량 LLM (None이면 메인 LLM 사용)
+        db_engine: DB 엔진 (None이면 step 결과 DB 저장 건너뜀)
 
     Returns:
         task_results가 채워진 상태
@@ -141,6 +145,17 @@ async def run_execution(
 
     if registry is None:
         registry = create_default_registry(light_llm=light_llm)
+
+    agent_run_id: int | None = None
+    if db_engine and state.get("case_id"):
+        try:
+            async with get_session(db_engine) as session:
+                agent_run = await create_agent_run(
+                    session, state["case_id"], "execution"
+                )
+                agent_run_id = agent_run.id
+        except Exception as exc:
+            logger.warning("agent_run_create_failed", error=str(exc))
 
     plan_steps = list(state.get("plan_steps", []))
     disk_image_path = state.get("disk_image_path") or ""
@@ -284,6 +299,25 @@ async def run_execution(
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
 
+        if db_engine and agent_run_id:
+            try:
+                async with get_session(db_engine) as session:
+                    await create_step_result(
+                        session,
+                        agent_run_id=agent_run_id,
+                        step_index=i,
+                        tool_name=last_result.get("agent_name", ""),
+                        output_summary=last_result.get("output", "")[:500],
+                        raw_output=last_result.get("output", ""),
+                        dfxml_fragment=dfxml_frag if last_result.get("status") == "success" else "",
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "step_result_save_failed",
+                    step_index=i,
+                    error=str(exc),
+                )
+
         if callback:
             step_result_for_cb = dict(last_result)
             if evidence_repo and evidence_repo[-1].get("task_id") == task["task_id"]:
@@ -314,6 +348,18 @@ async def run_execution(
             )
 
         i += 1
+
+    if db_engine and agent_run_id:
+        has_error = any(r.get("status") == "error" for r in results)
+        try:
+            async with get_session(db_engine) as session:
+                await update_agent_run(
+                    session,
+                    agent_run_id,
+                    status="error" if has_error else "success",
+                )
+        except Exception as exc:
+            logger.warning("agent_run_update_failed", error=str(exc))
 
     if rag_service and state.get("case_id"):
         results_summary = "\n".join(

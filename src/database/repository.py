@@ -122,6 +122,7 @@ async def create_step_result(
     tool_name: str,
     output_summary: str,
     raw_output: str = "",
+    dfxml_fragment: str = "",
 ) -> StepResult:
     """단계별 실행 결과 저장
 
@@ -132,6 +133,7 @@ async def create_step_result(
         tool_name: 사용된 MCP 도구 이름
         output_summary: 요약된 출력
         raw_output: 원본 전체 출력
+        dfxml_fragment: 해당 step의 DFXML 프래그먼트
 
     Returns:
         생성된 StepResult 인스턴스
@@ -142,6 +144,7 @@ async def create_step_result(
         tool_name=tool_name,
         output_summary=output_summary,
         raw_output=raw_output,
+        dfxml_fragment=dfxml_fragment,
     )
     session.add(step_result)
     await session.commit()
@@ -252,3 +255,29 @@ async def get_events_by_type(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def get_dfxml_fragment(
+    session: AsyncSession,
+    agent_run_id: int,
+    step_index: int,
+) -> str | None:
+    """특정 step의 DFXML 프래그먼트 조회
+
+    Args:
+        session: 비동기 DB 세션
+        agent_run_id: AgentRun ID
+        step_index: 조회할 step 인덱스
+
+    Returns:
+        DFXML 프래그먼트 문자열 또는 None
+    """
+    result = await session.execute(
+        select(StepResult.dfxml_fragment)
+        .where(
+            StepResult.agent_run_id == agent_run_id,
+            StepResult.step_index == step_index,
+        )
+    )
+    row = result.scalar_one_or_none()
+    return row if row else None
