@@ -30,6 +30,7 @@ from node_graph import (
     update_step_started,
     update_strategy_done,
 )
+from prompts.report import build_dfxml_prompt
 from rag.service import RAGService
 from state.manager import ManagerState
 from state.messages import TaskAssignment, TaskResult
@@ -222,17 +223,6 @@ async def run_execution(
             if sub_result.get("result"):
                 results.append(sub_result["result"])
                 context = sub_result["result"].get("output", "")[:500]
-
-                artifact_data = sub_result.get("dfxml_fragment", "")
-                if artifact_data:
-                    evidence_repo.append({
-                        "task_id": task["task_id"],
-                        "agent_name": agent_name,
-                        "server_name": server_name,
-                        "artifact": artifact_data,
-                        "format": "dfxml",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
             else:
                 error_result: TaskResult = {
                     "task_id": task["task_id"],
@@ -261,10 +251,43 @@ async def run_execution(
             output_summary=last_result.get("output", ""),
         )
 
+        dfxml_frag = ""
+        if last_result.get("status") == "success":
+            dfxml_llm = light_llm or llm
+            try:
+                dfxml_resp = await dfxml_llm.chat(
+                    messages=[{
+                        "role": "user",
+                        "content": "이 단계의 결과를 DFXML로 변환해주세요.",
+                    }],
+                    tools=None,
+                    system=build_dfxml_prompt([last_result]),
+                )
+                dfxml_frag = (
+                    dfxml_resp.content
+                    if isinstance(dfxml_resp.content, str) else ""
+                )
+            except Exception as exc:
+                logger.warning(
+                    "dfxml_fragment_generation_failed",
+                    task_id=task["task_id"],
+                    error=str(exc),
+                )
+
+            if dfxml_frag:
+                evidence_repo.append({
+                    "task_id": task["task_id"],
+                    "agent_name": agent_name,
+                    "server_name": server_name,
+                    "artifact": dfxml_frag,
+                    "format": "dfxml",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+
         if callback:
             step_result_for_cb = dict(last_result)
             if evidence_repo and evidence_repo[-1].get("task_id") == task["task_id"]:
-                step_result_for_cb["artifact"] = evidence_repo[-1]["artifact"]
+                step_result_for_cb["dfxml_fragment"] = evidence_repo[-1]["artifact"]
             callback.on_step_done(i, total, step, agent_name, step_result_for_cb)
 
         follow_up = last_result.get("follow_up")
@@ -325,7 +348,7 @@ async def run_report(
     state: ManagerState,
     llm: BaseLLMProvider,
     light_llm: BaseLLMProvider | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Report Agent 실행
 
     Args:
@@ -334,7 +357,7 @@ async def run_report(
         light_llm: 경량 LLM 프로바이더 (DFXML 등 단순 작업용)
 
     Returns:
-        {"summary": ..., "report": ..., "dfxml": ...}
+        summary, report, dfxml(통합), dfxml_fragments(step별) 포함 딕셔너리
     """
     task_results = state.get("task_results", [])
     case_description = ""
@@ -359,7 +382,11 @@ async def run_report(
         "summary": result.get("summary", ""),
         "report": result.get("report", ""),
         "dfxml": result.get("dfxml", ""),
+<<<<<<< HEAD
         "node_graph": graph,
+=======
+        "dfxml_fragments": result.get("dfxml_fragments", {}),
+>>>>>>> ecec267 (feat: generate DFXML fragments per step during execution)
     }
 
 
