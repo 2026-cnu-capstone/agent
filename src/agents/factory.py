@@ -181,8 +181,14 @@ class AgentRegistry:
         return create_sub_agent_state(task)
 
 
-def create_default_registry() -> AgentRegistry:
-    """Dissect 전용 설정이 등록된 기본 레지스트리 생성"""
+def create_default_registry(
+    light_llm: BaseLLMProvider | None = None,
+) -> AgentRegistry:
+    """Dissect 전용 설정이 등록된 기본 레지스트리 생성
+
+    Args:
+        light_llm: 요약 등 단순 작업에 사용할 경량 LLM (None이면 메인 LLM 사용)
+    """
     from agents.dissect.graph import build_dissect_graph, create_dissect_state
 
     registry = AgentRegistry()
@@ -195,7 +201,8 @@ def create_default_registry() -> AgentRegistry:
     ) -> Any:
         """Dissect 그래프 빌더를 GraphBuilder 시그니처에 맞게 변환"""
         return build_dissect_graph(
-            llm, mcp, purpose=purpose, available_plugins=extra_context
+            llm, mcp, purpose=purpose, available_plugins=extra_context,
+            light_llm=light_llm,
         )
 
     registry.register(
