@@ -230,20 +230,31 @@ def create_llm_provider(settings, api_choice: str = "default") -> BaseLLMProvide
 
     Args:
         settings: 애플리케이션 설정
-        api_choice: "default" (기존 .env) 또는 "mindlogic" (MindLogic Gateway)
+        api_choice: "default", "anthropic", "anthropic_haiku", "mindlogic" 중 하나
     """
+    from config import LLMConfig
+
+    if api_choice == "anthropic":
+        config = LLMConfig(model=settings.anthropic_model)
+        return AnthropicProvider(config, api_key=settings.anthropic_api_key)
+
+    if api_choice == "anthropic_haiku":
+        config = LLMConfig(model=settings.light_llm.model)
+        return AnthropicProvider(config, api_key=settings.anthropic_api_key)
+
     if api_choice == "mindlogic":
-        from config import LLMConfig
-        mindlogic_config = LLMConfig(
+        config = LLMConfig(
             provider=LLMProvider.OPENAI,
             model=settings.mindlogic_model,
             base_url=settings.mindlogic_base_url,
         )
-        return OpenAIProvider(mindlogic_config, api_key=settings.mindlogic_api_key)
+        return OpenAIProvider(config, api_key=settings.mindlogic_api_key)
 
-    if settings.llm.provider == LLMProvider.OPENAI:
-        return OpenAIProvider(settings.llm, api_key=settings.llm_api_key)
-    return AnthropicProvider(settings.llm, api_key=settings.llm_api_key)
+    config = LLMConfig(
+        provider=LLMProvider.OPENAI,
+        model=settings.openai_model,
+    )
+    return OpenAIProvider(config, api_key=settings.openai_api_key)
 
 
 class ConsoleExecutionCallback:
@@ -397,7 +408,7 @@ async def run_strategy_hitl(state, llm, rag_service=None) -> dict:
         print(f"  {DIM}전략 재수립 중...{RESET}")
 
 
-async def run_planning_hitl(state, llm, mcp, rag_service=None) -> dict:
+async def run_planning_hitl(state, llm, mcp) -> dict:
     """계획 수립 HITL 루프
 
     LLM이 계획을 생성하고 사용자가 승인/수정할 때까지 반복
@@ -408,7 +419,7 @@ async def run_planning_hitl(state, llm, mcp, rag_service=None) -> dict:
     while True:
         start = time.time()
         print(f"  {DIM}LLM 호출 중...{RESET}", end="", flush=True)
-        current = await run_planning(current, llm, mcp, rag_service=rag_service)
+        current = await run_planning(current, llm, mcp)
         print(f"\r  {GREEN}계획 생성 완료{RESET} ({_elapsed(start)})")
 
         rag_ctx = current.get("rag_context", "")
@@ -527,28 +538,52 @@ async def main() -> None:
     config_path = Path(__file__).parent.parent / "config" / "mcp_servers.json"
     settings = load_settings(config_path)
 
-    print(f"\n  {BOLD}API 선택{RESET}:")
-    print(f"    1. 기본 ({settings.llm.provider.value} / {settings.llm.model})")
+    has_default = bool(settings.openai_api_key)
+    has_anthropic = bool(settings.anthropic_api_key)
     has_mindlogic = bool(settings.mindlogic_api_key)
-    if has_mindlogic:
-        print(f"    2. MindLogic Gateway ({settings.mindlogic_model})")
+
+    print(f"\n  {BOLD}API 선택{RESET}:")
+    if has_default:
+        print(f"    1. OpenAI ({settings.openai_model})")
     else:
-        print(f"    {DIM}2. MindLogic Gateway (MINDLOGIC_API_KEY 미설정){RESET}")
+        print(f"    {DIM}1. OpenAI (OPENAI_API_KEY 미설정){RESET}")
+    if has_anthropic:
+        print(f"    2. Anthropic ({settings.anthropic_model})")
+        print(f"       {DIM}└ 경량 LLM: {settings.light_llm.model} (요약/변환용){RESET}")
+        print(f"    3. Anthropic 경량 ({settings.light_llm.model}) — 전 단계")
+    else:
+        print(f"    {DIM}2. Anthropic (ANTHROPIC_API_KEY 미설정){RESET}")
+        print(f"    {DIM}3. Anthropic 경량 (ANTHROPIC_API_KEY 미설정){RESET}")
+    if has_mindlogic:
+        print(f"    4. MindLogic Gateway ({settings.mindlogic_model})")
+        if has_anthropic:
+            print(f"       {DIM}└ 경량 LLM: {settings.light_llm.model} (요약/변환용){RESET}")
+    else:
+        print(f"    {DIM}4. MindLogic Gateway (MINDLOGIC_API_KEY 미설정){RESET}")
 
     api_choice = "default"
-    choice = input(f"  선택 (1/2, 기본=1) > ").strip()
-    if choice == "2" and has_mindlogic:
+    choice = input(f"  선택 (1/2/3/4, 기본=1) > ").strip()
+    if choice == "2" and has_anthropic:
+        api_choice = "anthropic"
+        print(f"  {GREEN}Anthropic API 사용{RESET}: {settings.anthropic_model}")
+    elif choice == "3" and has_anthropic:
+        api_choice = "anthropic_haiku"
+        print(f"  {GREEN}Anthropic 경량 사용{RESET}: {settings.light_llm.model} (전 단계)")
+    elif choice == "4" and has_mindlogic:
         api_choice = "mindlogic"
         print(f"  {GREEN}MindLogic Gateway 사용{RESET}: {settings.mindlogic_model}")
     else:
-        print(f"  {GREEN}기본 API 사용{RESET}: {settings.llm.provider.value} / {settings.llm.model}")
+        print(f"  {GREEN}OpenAI API 사용{RESET}: {settings.openai_model}")
 
     print(f"  {BOLD}MCP{RESET}:  {', '.join(settings.mcp.servers.keys()) or '(없음)'}")
 
-    if api_choice == "default" and not settings.llm_api_key:
-        print(f"  {RED}LLM_API_KEY가 설정되지 않았습니다.{RESET}")
+    if api_choice == "default" and not has_default:
+        print(f"  {RED}OPENAI_API_KEY가 설정되지 않았습니다.{RESET}")
         return
-    if api_choice == "mindlogic" and not settings.mindlogic_api_key:
+    if api_choice in ("anthropic", "anthropic_haiku") and not has_anthropic:
+        print(f"  {RED}ANTHROPIC_API_KEY가 설정되지 않았습니다.{RESET}")
+        return
+    if api_choice == "mindlogic" and not has_mindlogic:
         print(f"  {RED}MINDLOGIC_API_KEY가 설정되지 않았습니다.{RESET}")
         return
     if not settings.database_url:
@@ -573,6 +608,13 @@ async def main() -> None:
         print(f"\r  {GREEN}RAG 초기화 완료{RESET} (모델: {settings.rag.embedding_model})")
 
     llm = create_llm_provider(settings, api_choice)
+
+    light_llm: BaseLLMProvider | None = None
+    if api_choice == "anthropic_haiku":
+        pass
+    elif has_anthropic:
+        light_llm = AnthropicProvider(settings.light_llm, api_key=settings.anthropic_api_key)
+        print(f"  {BOLD}경량 LLM{RESET}: {settings.light_llm.model} (요약/변환용)")
 
     async with MCPClientManager(settings.mcp) as mcp:
         tools = await mcp.list_tools()
@@ -644,7 +686,7 @@ async def main() -> None:
                         print(f"  → 파싱된 실행 단계: {len(state.get('plan_steps', []))}개")
                         cache_key = ""
                     else:
-                        state = await run_planning_hitl(state, llm, mcp, rag_service=rag_service)
+                        state = await run_planning_hitl(state, llm, mcp)
                         if cache_key:
                             _save_cache(cache_key, "planning", {
                                 "analysis_plan": state.get("analysis_plan", ""),
@@ -660,7 +702,7 @@ async def main() -> None:
 
                     exec_start = time.time()
                     cb = ConsoleExecutionCallback()
-                    state = await run_execution(state, llm, mcp, callback=cb, rag_service=rag_service)
+                    state = await run_execution(state, llm, mcp, callback=cb, rag_service=rag_service, light_llm=light_llm)
 
                     task_results = state.get("task_results", [])
                     accumulated_results.extend(task_results)
@@ -671,7 +713,7 @@ async def main() -> None:
                     print_phase(4, "결과 요약")
                     start = time.time()
                     print(f"  {DIM}LLM 호출 중...{RESET}", end="", flush=True)
-                    report_result = await run_report(state, llm)
+                    report_result = await run_report(state, llm, light_llm=light_llm)
                     print(f"\r  {GREEN}요약 완료{RESET} ({_elapsed(start)})")
 
                     summary = report_result.get("summary", "")
@@ -688,7 +730,7 @@ async def main() -> None:
                         start = time.time()
                         print(f"  {DIM}LLM 호출 중...{RESET}", end="", flush=True)
                         state = {**state, "task_results": accumulated_results}
-                        report_result = await run_report(state, llm)
+                        report_result = await run_report(state, llm, light_llm=light_llm)
                         print(f"\r  {GREEN}보고서 생성 완료{RESET} ({_elapsed(start)})")
 
                         report = report_result.get("report", "")
