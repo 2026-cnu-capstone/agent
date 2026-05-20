@@ -26,13 +26,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import structlog
 from docx import Document
 from docx.shared import Pt
 
-import structlog
-
 from agents.manager.graph import (
-    ExecutionCallback,
     create_manager_state,
     run_execution,
     run_planning,
@@ -41,7 +39,10 @@ from agents.manager.graph import (
 )
 from config import LLMProvider, load_settings
 from database.engine import get_engine, init_db
+from database.repository import create_case
 from disk_image_validator import validate_image_path
+from event_callback import PersistentExecutionCallback
+from event_store import AnalysisEventStore
 from llm_provider.anthropic import AnthropicProvider
 from llm_provider.base import BaseLLMProvider
 from llm_provider.openai import OpenAIProvider
@@ -49,7 +50,6 @@ from mcp_client.client import MCPClientManager
 from rag.embedding import Embedder
 from rag.pgvector_store import PgVectorStore
 from rag.service import RAGService
-
 
 DIM = "\033[2m"
 BOLD = "\033[1m"
@@ -258,10 +258,26 @@ def create_llm_provider(settings, api_choice: str = "default") -> BaseLLMProvide
 
 
 class ConsoleExecutionCallback:
-    """Sub-Agent 실행 진행 상황을 콘솔에 시각적으로 출력"""
+    """Sub-Agent 실행 진행 상황을 콘솔에 시각적으로 출력
 
-    def __init__(self) -> None:
+    persistent_cb가 설정되면 DB 영속화도 동시 수행
+
+    Attributes:
+        _step_starts: 단계별 시작 시각
+        _persistent_cb: DB 저장용 콜백 (None이면 콘솔만)
+    """
+
+    def __init__(
+        self,
+        persistent_cb: PersistentExecutionCallback | None = None,
+    ) -> None:
+        """ConsoleExecutionCallback 초기화
+
+        Args:
+            persistent_cb: DB 영속화 콜백 (None이면 콘솔 출력만)
+        """
         self._step_starts: dict[int, float] = {}
+        self._persistent_cb = persistent_cb
 
     def on_step_start(self, step_index: int, total: int, step: dict, agent_name: str) -> None:
         """단계 시작 시 진행 바와 단계 정보 출력"""
@@ -272,6 +288,9 @@ class ConsoleExecutionCallback:
         print(f"\n  {bar}")
         print_step_progress(step_index, total, name, agent_name, "running")
 
+        if self._persistent_cb:
+            self._persistent_cb.on_step_start(step_index, total, step, agent_name)
+
     def on_step_done(self, step_index: int, total: int, step: dict, agent_name: str, result: dict) -> None:
         """단계 완료 시 결과 요약 출력"""
         elapsed = _elapsed(self._step_starts.get(step_index, time.time()))
@@ -281,10 +300,16 @@ class ConsoleExecutionCallback:
 
         print_step_result(step_index, total, name, agent_name, status, output, elapsed)
 
+        if self._persistent_cb:
+            self._persistent_cb.on_step_done(step_index, total, step, agent_name, result)
+
     def on_step_skip(self, step_index: int, total: int, step: dict) -> None:
         """수동 단계 건너뛸 때 출력"""
         name = step.get("name", step.get("purpose", ""))
         print_step_progress(step_index, total, name, "manual", "skip")
+
+        if self._persistent_cb:
+            self._persistent_cb.on_step_skip(step_index, total, step)
 
     def _progress_bar(self, current: int, total: int) -> str:
         """텍스트 진행 바 생성"""
@@ -562,7 +587,7 @@ async def main() -> None:
         print(f"    {DIM}4. MindLogic Gateway (MINDLOGIC_API_KEY 미설정){RESET}")
 
     api_choice = "default"
-    choice = input(f"  선택 (1/2/3/4, 기본=1) > ").strip()
+    choice = input("  선택 (1/2/3/4, 기본=1) > ").strip()
     if choice == "2" and has_anthropic:
         api_choice = "anthropic"
         print(f"  {GREEN}Anthropic API 사용{RESET}: {settings.anthropic_model}")
@@ -592,6 +617,7 @@ async def main() -> None:
 
     db_engine = get_engine(settings.database_url)
     await init_db(db_engine)
+    event_store = AnalysisEventStore(db_engine)
     print(f"  {BOLD}DB{RESET}:   초기화 완료")
 
     rag_service = None
@@ -651,6 +677,19 @@ async def main() -> None:
                 break
 
             try:
+                from database.engine import get_session
+
+                async with get_session(db_engine) as session:
+                    case = await create_case(
+                        session,
+                        user_prompt=user_input,
+                        disk_image_path=image_path,
+                        disk_image_format=image_format,
+                    )
+                print(f"  {DIM}케이스 #{case.id} 생성{RESET}")
+
+                persistent_cb = PersistentExecutionCallback(event_store, case.id)
+
                 state = create_manager_state(
                     user_message=user_input,
                     disk_image_path=image_path,
@@ -675,6 +714,11 @@ async def main() -> None:
                         })
                         print(f"[Cache] 전략 캐시 저장 ({cache_key})")
 
+                await persistent_cb.emit_phase_event(
+                    "strategy_ready",
+                    {"strategy": state.get("analysis_strategy", "")[:500]},
+                )
+
                 accumulated_results = []
 
                 while True:
@@ -698,15 +742,23 @@ async def main() -> None:
                             cache_key = ""
 
                     steps = state.get("plan_steps", [])
+                    await persistent_cb.emit_phase_event(
+                        "plan_ready",
+                        {"total_steps": len(steps)},
+                    )
                     print_phase(3, f"Sub-Agent 실행 ({len(steps)}단계)")
 
                     exec_start = time.time()
-                    cb = ConsoleExecutionCallback()
+                    cb = ConsoleExecutionCallback(persistent_cb=persistent_cb)
                     state = await run_execution(state, llm, mcp, callback=cb, rag_service=rag_service, light_llm=light_llm)
 
                     task_results = state.get("task_results", [])
                     accumulated_results.extend(task_results)
 
+                    await persistent_cb.emit_phase_event(
+                        "execution_done",
+                        {"total_steps": len(steps), "elapsed": _elapsed(exec_start)},
+                    )
                     print(f"\n  {GREEN}실행 완료{RESET} ({_elapsed(exec_start)})")
                     print_results_table(task_results)
 
@@ -738,6 +790,10 @@ async def main() -> None:
                         print_section("포렌식 분석 보고서", report)
 
                         docx_path, dfxml_path = save_report(report, dfxml)
+                        await persistent_cb.emit_phase_event(
+                            "report_ready",
+                            {"report_path": str(docx_path)},
+                        )
                         print(f"  {GREEN}보고서 저장{RESET}: {docx_path}")
                         if dfxml_path:
                             print(f"  {GREEN}DFXML 저장{RESET}: {dfxml_path}")
