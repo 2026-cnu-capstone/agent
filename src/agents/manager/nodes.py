@@ -75,36 +75,36 @@ async def planning_node(
     *,
     llm: BaseLLMProvider,
     mcp: MCPClientManager,
-    rag_service: RAGService | None = None,
 ) -> dict[str, Any]:
     """수립된 전략을 바탕으로 세부 실행 계획 수립
+
+    strategy_node에서 저장된 rag_context를 재사용하여
+    중복 RAG 검색을 방지
 
     Args:
         state: Manager 상태
         llm: LLM 프로바이더
         mcp: MCP 클라이언트 매니저 (도구 목록 조회용)
-        rag_service: RAG 서비스 (None이면 RAG 비활성)
     """
     server_names = mcp.connected_servers
     server_list = "\n".join(f"- {name}" for name in server_names) if server_names else ""
 
-    rag_context = ""
-    if rag_service:
-        strategy_text = state.get("analysis_strategy", "")
-        if strategy_text:
-            results = await rag_service.search_similar_plans(strategy_text)
-            rag_context = RAGService.format_rag_context(results)
-            if results:
-                logger.info(
-                    "rag_planning_injected",
-                    hits=len(results),
-                    top_score=results[0].score,
-                    context_length=len(rag_context),
-                )
+    rag_context = state.get("rag_context", "")
 
-    messages = list(state["messages"])
-    if messages and messages[-1].get("role") == "assistant":
-        messages.append({"role": "user", "content": "위 전략을 바탕으로 세부 실행 계획을 수립해주세요."})
+    incoming_messages = state.get("messages", [])
+    has_feedback = (
+        len(incoming_messages) == 1
+        and "[수정 요청]" in incoming_messages[0].get("content", "")
+    )
+
+    if has_feedback:
+        messages = list(incoming_messages)
+    else:
+        strategy_text = state.get("analysis_strategy", "")
+        messages = [
+            {"role": "user", "content": strategy_text},
+            {"role": "user", "content": "위 전략을 바탕으로 세부 실행 계획을 수립해주세요."},
+        ]
 
     response = await llm.chat(
         messages=messages,
@@ -117,13 +117,12 @@ async def planning_node(
     )
     plan_text = response.content if isinstance(response.content, str) else ""
     plan_steps = _parse_plan_steps(plan_text)
-    logger.info("plan_created", length=len(plan_text), steps=len(plan_steps), rag_hits=bool(rag_context))
+    logger.info("plan_created", length=len(plan_text), steps=len(plan_steps))
 
     return {
         "messages": [{"role": "assistant", "content": response.content}],
         "analysis_plan": plan_text,
         "plan_steps": plan_steps,
-        "rag_context": rag_context,
         "phase": "execution",
     }
 
@@ -142,8 +141,8 @@ def routing_node(state: ManagerState) -> dict[str, Any]:
     context = ""
     if task_results:
         context = "\n".join(
-            f"[{r['agent_name']}] {r['output'][:500]}"
-            for r in task_results[-3:]
+            f"[{r['agent_name']}] {r['output'][:300]}"
+            for r in task_results[-2:]
         )
 
     task_queue: list[TaskAssignment] = []

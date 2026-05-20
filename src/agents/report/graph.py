@@ -37,14 +37,18 @@ class ReportAgentState(TypedDict):
     """생성된 DFXML XML 문자열"""
 
 
-def build_report_graph(llm: BaseLLMProvider) -> Any:
+def build_report_graph(
+    llm: BaseLLMProvider,
+    light_llm: BaseLLMProvider | None = None,
+) -> Any:
     """Report Agent subgraph 빌드
 
     그래프 토폴로지:
         START → summary → report → dfxml → END
 
     Args:
-        llm: LLM 프로바이더
+        llm: 메인 LLM 프로바이더 (summary, report 생성)
+        light_llm: 경량 LLM 프로바이더 (dfxml 변환, None이면 llm 사용)
 
     Returns:
         컴파일된 LangGraph subgraph
@@ -53,7 +57,7 @@ def build_report_graph(llm: BaseLLMProvider) -> Any:
 
     graph.add_node("summary", partial(summary_node, llm=llm))
     graph.add_node("report", partial(report_node, llm=llm))
-    graph.add_node("dfxml", partial(dfxml_node, llm=llm))
+    graph.add_node("dfxml", partial(dfxml_node, llm=light_llm or llm))
 
     graph.add_edge(START, "summary")
     graph.add_edge("summary", "report")
