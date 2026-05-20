@@ -31,7 +31,8 @@ async def sub_agent_llm_node(
     """Sub-Agent LLM 호출 노드
 
     할당된 task의 목적과 컨텍스트를 바탕으로 LLM이
-    텍스트 응답 또는 도구 호출을 생성
+    텍스트 응답 또는 도구 호출을 생성.
+    도구 스키마는 첫 호출 시 캐싱하여 이후 iteration에서 재사용.
 
     Args:
         state: Sub-Agent 상태
@@ -39,7 +40,12 @@ async def sub_agent_llm_node(
         mcp: 이 Sub-Agent 전용 MCP 클라이언트
         system_prompt: 에이전트별 시스템 프롬프트
     """
-    tools = await mcp.list_tools()
+    cached_tools = state.get("tools")
+    if cached_tools:
+        tools = cached_tools
+    else:
+        tools = await mcp.list_tools()
+
     if isinstance(llm, AnthropicProvider):
         tool_params = mcp_tools_to_anthropic(tools)
     else:
@@ -85,16 +91,14 @@ async def sub_agent_llm_node(
                 for tc in response.tool_calls
             ]
 
-    if response.tool_calls:
-        return {
-            "messages": [assistant_message],
-            "pending_tool_calls": [asdict(tc) for tc in response.tool_calls],
-        }
-
-    return {
+    state_update: dict[str, Any] = {
         "messages": [assistant_message],
-        "pending_tool_calls": [],
+        "pending_tool_calls": [asdict(tc) for tc in response.tool_calls] if response.tool_calls else [],
     }
+    if not cached_tools:
+        state_update["tools"] = tools
+
+    return state_update
 
 
 async def sub_agent_tool_node(

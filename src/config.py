@@ -86,15 +86,16 @@ class RAGConfig(BaseModel):
 
     enabled: bool = False
     embedding_model: str = "BAAI/bge-m3"
-    search_top_k: int = 3
-    similarity_threshold: float = 0.5
+    search_top_k: int = 1
+    similarity_threshold: float = 0.7
 
 
 class Settings(BaseSettings):
     """애플리케이션 전체 설정
 
     환경변수 매핑:
-        LLM_API_KEY            → llm_api_key (기본 OpenAI)
+        OPENAI_API_KEY         → openai_api_key
+        ANTHROPIC_API_KEY      → anthropic_api_key (Anthropic 전용)
         LLM_MODEL              → llm.model (load_settings에서 처리)
         LLM_BASE_URL           → llm.base_url (load_settings에서 처리)
         MINDLOGIC_API_KEY      → mindlogic_api_key (MindLogic Gateway)
@@ -111,10 +112,23 @@ class Settings(BaseSettings):
     )
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    light_llm: LLMConfig = Field(
+        default_factory=lambda: LLMConfig(
+            provider=LLMProvider.ANTHROPIC,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4096,
+        ),
+        description="요약, DFXML 변환 등 단순 작업에 사용하는 경량 LLM",
+    )
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     rag: RAGConfig = Field(default_factory=RAGConfig)
 
-    llm_api_key: str = ""
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o"
+
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-4-20250514"
+
     llm_model: str = ""
     llm_base_url: str = ""
 

@@ -20,7 +20,7 @@ from agents.base import (
     sub_agent_llm_node,
 )
 from agents.dissect.nodes import dissect_tool_node
-from prompts.dissect import build_dfxml_fragment_prompt, build_dissect_prompt, format_tool_docs
+from prompts.dissect import build_dissect_prompt, format_tool_docs
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
 from state.sub_agent import SubAgentState
@@ -66,17 +66,11 @@ def _parse_followup(output: str) -> tuple[str, dict[str, Any] | None]:
 
 async def dissect_finalize_node(
     state: SubAgentState,
-    *,
-    llm: BaseLLMProvider,
 ) -> dict[str, Any]:
     """Dissect Sub-Agent finalize 노드
 
-    base finalize로 TaskResult를 생성한 후,
-    follow-up 마커를 파싱하고 DFXML 프래그먼트를 생성
-
-    Args:
-        state: Sub-Agent 상태
-        llm: LLM 프로바이더 (DFXML 생성용)
+    base finalize로 TaskResult를 생성한 후 follow-up 마커를 파싱.
+    DFXML 생성은 Report 단계에서 일괄 처리하므로 여기서는 수행하지 않음.
     """
     base_updates = await sub_agent_finalize_node(state)
 
@@ -85,7 +79,6 @@ async def dissect_finalize_node(
         return {**base_updates, "dfxml_fragment": ""}
 
     task = state["task"]
-    purpose = task.get("step", {}).get("purpose", "")
     output = result.get("output", "")
 
     clean_output, follow_up = _parse_followup(output)
@@ -96,24 +89,7 @@ async def dissect_finalize_node(
     result["output"] = clean_output
     result["follow_up"] = follow_up
 
-    dfxml_fragment = ""
-    if clean_output.strip():
-        try:
-            response = await llm.chat(
-                messages=[{"role": "user", "content": "분석 결과를 DFXML 프래그먼트로 변환해주세요."}],
-                tools=None,
-                system=build_dfxml_fragment_prompt(
-                    agent_name=task.get("agent_name", "dissect"),
-                    task_purpose=purpose,
-                    analysis_output=clean_output,
-                ),
-            )
-            dfxml_fragment = response.content if isinstance(response.content, str) else ""
-            logger.info("dfxml_fragment_generated", task_id=task.get("task_id"), length=len(dfxml_fragment))
-        except Exception as exc:
-            logger.warning("dfxml_fragment_failed", error=str(exc))
-
-    return {**base_updates, "dfxml_fragment": dfxml_fragment}
+    return {**base_updates, "dfxml_fragment": ""}
 
 
 def _should_continue(state: SubAgentState) -> str:
@@ -131,6 +107,7 @@ def build_dissect_graph(
     mcp: MCPClientManager,
     purpose: str = "",
     available_plugins: str = "",
+    light_llm: BaseLLMProvider | None = None,
 ) -> Any:
     """Dissect Sub-Agent subgraph 빌드
 
@@ -146,6 +123,7 @@ def build_dissect_graph(
         mcp: Dissect MCP 서버 전용 클라이언트 매니저
         purpose: 현재 작업 목적 (프롬프트에 주입)
         available_plugins: 사전 조회된 아티팩트 플러그인 목록
+        light_llm: 요약 전용 경량 LLM (None이면 llm 사용)
 
     Returns:
         컴파일된 LangGraph subgraph
@@ -172,11 +150,11 @@ def build_dissect_graph(
     )
     graph.add_node(
         "tools",
-        partial(dissect_tool_node, llm=llm, mcp=mcp),
+        partial(dissect_tool_node, llm=llm, mcp=mcp, summary_llm=light_llm),
     )
     graph.add_node(
         "finalize",
-        partial(dissect_finalize_node, llm=llm),
+        dissect_finalize_node,
     )
 
     graph.add_edge(START, "llm")

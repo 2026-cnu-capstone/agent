@@ -56,6 +56,7 @@ async def dissect_tool_node(
     *,
     llm: BaseLLMProvider,
     mcp: MCPClientManager,
+    summary_llm: BaseLLMProvider | None = None,
 ) -> dict[str, Any]:
     """Dissect 전용 도구 실행 노드
 
@@ -65,8 +66,9 @@ async def dissect_tool_node(
 
     Args:
         state: Sub-Agent 상태
-        llm: LLM 프로바이더 (결과 포맷팅 및 요약용)
+        llm: LLM 프로바이더 (결과 포맷팅용)
         mcp: Dissect MCP 클라이언트
+        summary_llm: 요약 전용 경량 LLM (None이면 llm 사용)
     """
     from llm_provider.anthropic import AnthropicProvider
 
@@ -90,7 +92,7 @@ async def dissect_tool_node(
                 output=raw_content,
                 tool_name=tc["name"],
                 purpose=purpose,
-                llm=llm,
+                llm=summary_llm or llm,
             )
             if tc["name"] not in METADATA_TOOLS:
                 summarized_chunks.append(content)

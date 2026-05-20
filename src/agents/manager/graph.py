@@ -71,20 +71,21 @@ async def run_planning(
     state: ManagerState,
     llm: BaseLLMProvider,
     mcp: MCPClientManager,
-    rag_service: RAGService | None = None,
 ) -> ManagerState:
     """계획 수립 단계 실행
+
+    strategy_node에서 저장된 rag_context를 재사용하므로
+    별도 rag_service 주입이 불필요
 
     Args:
         state: 전략이 확정된 Manager 상태
         llm: LLM 프로바이더
         mcp: MCP 클라이언트 매니저
-        rag_service: RAG 서비스 (None이면 RAG 비활성)
 
     Returns:
         plan_steps가 채워진 상태
     """
-    updates = await planning_node(state, llm=llm, mcp=mcp, rag_service=rag_service)
+    updates = await planning_node(state, llm=llm, mcp=mcp)
     return {**state, **updates}
 
 
@@ -95,6 +96,7 @@ async def run_execution(
     callback: ExecutionCallback | None = None,
     registry: AgentRegistry | None = None,
     rag_service: RAGService | None = None,
+    light_llm: BaseLLMProvider | None = None,
 ) -> ManagerState:
     """Sub-Agent 실행 단계
 
@@ -109,6 +111,7 @@ async def run_execution(
         callback: 진행 상황 콜백 (None이면 무시)
         registry: Sub-Agent 레지스트리 (None이면 기본 레지스트리 사용)
         rag_service: RAG 서비스 (None이면 결과 저장 건너뜀)
+        light_llm: 요약 등 단순 작업에 사용할 경량 LLM (None이면 메인 LLM 사용)
 
     Returns:
         task_results가 채워진 상태
@@ -118,7 +121,7 @@ async def run_execution(
     from datetime import datetime, timezone
 
     if registry is None:
-        registry = create_default_registry()
+        registry = create_default_registry(light_llm=light_llm)
 
     plan_steps = list(state.get("plan_steps", []))
     disk_image_path = state.get("disk_image_path") or ""
@@ -290,12 +293,14 @@ async def run_execution(
 async def run_report(
     state: ManagerState,
     llm: BaseLLMProvider,
+    light_llm: BaseLLMProvider | None = None,
 ) -> dict[str, str]:
     """Report Agent 실행
 
     Args:
         state: 실행 결과가 포함된 Manager 상태
-        llm: LLM 프로바이더
+        llm: 메인 LLM 프로바이더
+        light_llm: 경량 LLM 프로바이더 (DFXML 등 단순 작업용)
 
     Returns:
         {"summary": ..., "report": ..., "dfxml": ...}
@@ -305,7 +310,7 @@ async def run_report(
     if state.get("messages"):
         case_description = state["messages"][0].get("content", "")
 
-    report_graph = build_report_graph(llm)
+    report_graph = build_report_graph(llm, light_llm=light_llm)
     report_state = create_report_state(
         task_results=task_results,
         case_description=case_description,
