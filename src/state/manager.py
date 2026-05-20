@@ -70,3 +70,6 @@ class ManagerState(TypedDict):
 
     rag_context: str
     """RAG 검색 결과 텍스트 (전략/계획 수립 시 프롬프트에 주입)"""
+
+    node_graph: dict[str, Any]
+    """프론트엔드 DAG 시각화를 위한 노드 그래프 데이터 (nodes, edges)"""
