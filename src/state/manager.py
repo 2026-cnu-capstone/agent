@@ -7,7 +7,11 @@ from typing import Annotated, Any
 
 from typing_extensions import TypedDict
 
-from state.messages import AgentMessage, TaskAssignment, TaskResult
+from state.messages import (
+    AgentMessage,
+    TaskAssignment,
+    TaskResult,
+)
 
 
 class ManagerState(TypedDict):
@@ -67,3 +71,11 @@ class ManagerState(TypedDict):
 
     evidence_repository: Annotated[list[dict[str, Any]], operator.add]
     """Sub-Agent별 DFXML 증거 프래그먼트 누적 저장소 (Evidence Repository)"""
+
+    node_graph: dict[str, Any]
+    """프론트엔드 DAG 시각화를 위한 노드 그래프 데이터
+
+    구조:
+        nodes: list[NodeRelation] — 노드 목록
+        edges: list[NodeEdge] — 엣지 목록
+    """

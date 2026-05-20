@@ -6,22 +6,30 @@ HITL 게이트는 run_agent.py에서 명시적으로 제어하므로,
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import structlog
 
 from agents.dissect.graph import build_dissect_graph, create_dissect_state
-from constants import EXECUTION_STEP_DELAY, MAX_FOLLOWUP_STEPS
 from agents.manager.nodes import (
     _extract_agent_name,
-    _parse_plan_steps,
-    strategy_node,
     planning_node,
+    strategy_node,
 )
 from agents.report.graph import build_report_graph, create_report_state
+from constants import EXECUTION_STEP_DELAY, MAX_FOLLOWUP_STEPS
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
+from node_graph import (
+    add_followup_step,
+    create_initial_graph,
+    update_planning_done,
+    update_report_done,
+    update_report_started,
+    update_step_done,
+    update_step_started,
+    update_strategy_done,
+)
 from state.manager import ManagerState
 from state.messages import TaskAssignment, TaskResult
 
@@ -59,7 +67,12 @@ async def run_strategy(
     """
     system_profile = state.get("system_profile") or ""
     updates = await strategy_node(state, llm=llm, system_profile=system_profile)
-    return {**state, **updates}
+    new_state = {**state, **updates}
+    graph = new_state.get("node_graph") or create_initial_graph()
+    new_state["node_graph"] = update_strategy_done(
+        graph, new_state.get("analysis_strategy", "")
+    )
+    return new_state
 
 
 async def run_planning(
@@ -78,7 +91,12 @@ async def run_planning(
         plan_steps가 채워진 상태
     """
     updates = await planning_node(state, llm=llm, mcp=mcp)
-    return {**state, **updates}
+    new_state = {**state, **updates}
+    graph = new_state.get("node_graph") or create_initial_graph()
+    new_state["node_graph"] = update_planning_done(
+        graph, new_state.get("plan_steps", [])
+    )
+    return new_state
 
 
 async def run_execution(
@@ -110,6 +128,7 @@ async def run_execution(
     evidence_repo: list[dict[str, Any]] = []
     followup_count = 0
     total = len(plan_steps)
+    graph = state.get("node_graph") or create_initial_graph()
 
     available_plugins = ""
     try:
@@ -154,11 +173,13 @@ async def run_execution(
                 "artifacts": [],
             }
             results.append(result)
+            graph = update_step_done(graph, i, "skip")
             if callback:
                 callback.on_step_skip(i, total, step)
             logger.info("manual_step", step=step.get("index"), purpose=purpose)
             continue
 
+        graph = update_step_started(graph, i)
         if callback:
             callback.on_step_start(i, total, step, agent_name)
 
@@ -205,14 +226,20 @@ async def run_execution(
             }
             results.append(error_result)
 
+        last_result = results[-1]
+        graph = update_step_done(
+            graph, i, last_result.get("status", "error"),
+            output_summary=last_result.get("output", ""),
+        )
+
         if callback:
-            step_result_for_cb = dict(results[-1])
+            step_result_for_cb = dict(last_result)
             dfxml_frag_for_cb = evidence_repo[-1]["dfxml_fragment"] if evidence_repo and evidence_repo[-1].get("task_id") == task["task_id"] else ""
             if dfxml_frag_for_cb:
                 step_result_for_cb["dfxml_fragment"] = dfxml_frag_for_cb
             callback.on_step_done(i, total, step, agent_name, step_result_for_cb)
 
-        follow_up = results[-1].get("follow_up")
+        follow_up = last_result.get("follow_up")
         if follow_up and followup_count < MAX_FOLLOWUP_STEPS:
             suggested = follow_up.get("suggested_step", {})
             new_step = {
@@ -226,6 +253,9 @@ async def run_execution(
             plan_steps.append(new_step)
             total = len(plan_steps)
             followup_count += 1
+            graph = add_followup_step(
+                graph, len(plan_steps) - 1, new_step["name"]
+            )
             logger.info(
                 "followup_step_added",
                 reason=follow_up.get("reason"),
@@ -238,6 +268,7 @@ async def run_execution(
         **state,
         "task_results": results,
         "evidence_repository": evidence_repo,
+        "node_graph": graph,
         "phase": "report",
     }
 
@@ -260,6 +291,9 @@ async def run_report(
     if state.get("messages"):
         case_description = state["messages"][0].get("content", "")
 
+    graph = state.get("node_graph") or create_initial_graph()
+    graph = update_report_started(graph)
+
     report_graph = build_report_graph(llm)
     report_state = create_report_state(
         task_results=task_results,
@@ -269,10 +303,13 @@ async def run_report(
     )
 
     result = await report_graph.ainvoke(report_state)
+    graph = update_report_done(graph)
+
     return {
         "summary": result.get("summary", ""),
         "report": result.get("report", ""),
         "dfxml": result.get("dfxml", ""),
+        "node_graph": graph,
     }
 
 
@@ -308,4 +345,5 @@ def create_manager_state(
         hitl_pending=False,
         hitl_type="",
         evidence_repository=[],
+        node_graph=create_initial_graph(),
     )
