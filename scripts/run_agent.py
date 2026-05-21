@@ -678,17 +678,23 @@ async def main() -> None:
 
             try:
                 from database.engine import get_session
+                from database.repository import create_case
 
-                async with get_session(db_engine) as session:
-                    case = await create_case(
-                        session,
-                        user_prompt=user_input,
-                        disk_image_path=image_path,
-                        disk_image_format=image_format,
-                    )
-                print(f"  {DIM}케이스 #{case.id} 생성{RESET}")
+                case_id = None
+                try:
+                    async with get_session(db_engine) as session:
+                        case = await create_case(
+                            session,
+                            user_prompt=user_input,
+                            disk_image_path=image_path,
+                            disk_image_format=image_format,
+                        )
+                        case_id = case.id
+                    print(f"  {DIM}케이스 #{case_id} 생성{RESET}")
+                except Exception as exc:
+                    print(f"  {YELLOW}케이스 DB 저장 실패: {exc}{RESET}")
 
-                persistent_cb = PersistentExecutionCallback(event_store, case.id)
+                persistent_cb = PersistentExecutionCallback(event_store, case_id) if case_id else None
 
                 state = create_manager_state(
                     user_message=user_input,
@@ -696,6 +702,8 @@ async def main() -> None:
                     disk_image_format=image_format,
                     system_profile=system_profile,
                 )
+                if case_id:
+                    state["case_id"] = case_id
 
                 cache_key = _cache_key(image_path, user_input) if args.use_cache else ""
 
@@ -750,7 +758,7 @@ async def main() -> None:
 
                     exec_start = time.time()
                     cb = ConsoleExecutionCallback(persistent_cb=persistent_cb)
-                    state = await run_execution(state, llm, mcp, callback=cb, rag_service=rag_service, light_llm=light_llm)
+                    state = await run_execution(state, llm, mcp, callback=cb, rag_service=rag_service, light_llm=light_llm, db_engine=db_engine)
 
                     task_results = state.get("task_results", [])
                     accumulated_results.extend(task_results)

@@ -18,6 +18,8 @@ from agents.manager.nodes import (
 )
 from agents.report.graph import build_report_graph, create_report_state
 from constants import EXECUTION_STEP_DELAY, MAX_FOLLOWUP_STEPS
+from database.engine import get_session
+from database.repository import create_agent_run, create_step_result, update_agent_run
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
 from node_graph import (
@@ -30,6 +32,7 @@ from node_graph import (
     update_step_started,
     update_strategy_done,
 )
+from prompts.report import build_dfxml_prompt
 from rag.service import RAGService
 from state.manager import ManagerState
 from state.messages import TaskAssignment, TaskResult
@@ -115,6 +118,7 @@ async def run_execution(
     registry: AgentRegistry | None = None,
     rag_service: RAGService | None = None,
     light_llm: BaseLLMProvider | None = None,
+    db_engine: Any | None = None,
 ) -> ManagerState:
     """Sub-Agent 실행 단계
 
@@ -130,6 +134,7 @@ async def run_execution(
         registry: Sub-Agent 레지스트리 (None이면 기본 레지스트리 사용)
         rag_service: RAG 서비스 (None이면 결과 저장 건너뜀)
         light_llm: 요약 등 단순 작업에 사용할 경량 LLM (None이면 메인 LLM 사용)
+        db_engine: DB 엔진 (None이면 step 결과 DB 저장 건너뜀)
 
     Returns:
         task_results가 채워진 상태
@@ -140,6 +145,17 @@ async def run_execution(
 
     if registry is None:
         registry = create_default_registry(light_llm=light_llm)
+
+    agent_run_id: int | None = None
+    if db_engine and state.get("case_id"):
+        try:
+            async with get_session(db_engine) as session:
+                agent_run = await create_agent_run(
+                    session, state["case_id"], "execution"
+                )
+                agent_run_id = agent_run.id
+        except Exception as exc:
+            logger.warning("agent_run_create_failed", error=str(exc))
 
     plan_steps = list(state.get("plan_steps", []))
     disk_image_path = state.get("disk_image_path") or ""
@@ -222,17 +238,6 @@ async def run_execution(
             if sub_result.get("result"):
                 results.append(sub_result["result"])
                 context = sub_result["result"].get("output", "")[:500]
-
-                artifact_data = sub_result.get("dfxml_fragment", "")
-                if artifact_data:
-                    evidence_repo.append({
-                        "task_id": task["task_id"],
-                        "agent_name": agent_name,
-                        "server_name": server_name,
-                        "artifact": artifact_data,
-                        "format": "dfxml",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
             else:
                 error_result: TaskResult = {
                     "task_id": task["task_id"],
@@ -261,10 +266,62 @@ async def run_execution(
             output_summary=last_result.get("output", ""),
         )
 
+        dfxml_frag = ""
+        if last_result.get("status") == "success":
+            dfxml_llm = light_llm or llm
+            try:
+                dfxml_resp = await dfxml_llm.chat(
+                    messages=[{
+                        "role": "user",
+                        "content": "이 단계의 결과를 DFXML로 변환해주세요.",
+                    }],
+                    tools=None,
+                    system=build_dfxml_prompt([last_result]),
+                )
+                dfxml_frag = (
+                    dfxml_resp.content
+                    if isinstance(dfxml_resp.content, str) else ""
+                )
+            except Exception as exc:
+                logger.warning(
+                    "dfxml_fragment_generation_failed",
+                    task_id=task["task_id"],
+                    error=str(exc),
+                )
+
+            if dfxml_frag:
+                evidence_repo.append({
+                    "task_id": task["task_id"],
+                    "agent_name": agent_name,
+                    "server_name": server_name,
+                    "artifact": dfxml_frag,
+                    "format": "dfxml",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+
+        if db_engine and agent_run_id:
+            try:
+                async with get_session(db_engine) as session:
+                    await create_step_result(
+                        session,
+                        agent_run_id=agent_run_id,
+                        step_index=i,
+                        tool_name=last_result.get("agent_name", ""),
+                        output_summary=last_result.get("output", "")[:500],
+                        raw_output=last_result.get("output", ""),
+                        dfxml_fragment=dfxml_frag if last_result.get("status") == "success" else "",
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "step_result_save_failed",
+                    step_index=i,
+                    error=str(exc),
+                )
+
         if callback:
             step_result_for_cb = dict(last_result)
             if evidence_repo and evidence_repo[-1].get("task_id") == task["task_id"]:
-                step_result_for_cb["artifact"] = evidence_repo[-1]["artifact"]
+                step_result_for_cb["dfxml_fragment"] = evidence_repo[-1]["artifact"]
             callback.on_step_done(i, total, step, agent_name, step_result_for_cb)
 
         follow_up = last_result.get("follow_up")
@@ -291,6 +348,18 @@ async def run_execution(
             )
 
         i += 1
+
+    if db_engine and agent_run_id:
+        has_error = any(r.get("status") == "error" for r in results)
+        try:
+            async with get_session(db_engine) as session:
+                await update_agent_run(
+                    session,
+                    agent_run_id,
+                    status="error" if has_error else "success",
+                )
+        except Exception as exc:
+            logger.warning("agent_run_update_failed", error=str(exc))
 
     if rag_service and state.get("case_id"):
         results_summary = "\n".join(
@@ -325,7 +394,7 @@ async def run_report(
     state: ManagerState,
     llm: BaseLLMProvider,
     light_llm: BaseLLMProvider | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Report Agent 실행
 
     Args:
@@ -334,7 +403,7 @@ async def run_report(
         light_llm: 경량 LLM 프로바이더 (DFXML 등 단순 작업용)
 
     Returns:
-        {"summary": ..., "report": ..., "dfxml": ...}
+        summary, report, dfxml(통합), dfxml_fragments(step별) 포함 딕셔너리
     """
     task_results = state.get("task_results", [])
     case_description = ""
@@ -359,7 +428,11 @@ async def run_report(
         "summary": result.get("summary", ""),
         "report": result.get("report", ""),
         "dfxml": result.get("dfxml", ""),
+<<<<<<< HEAD
         "node_graph": graph,
+=======
+        "dfxml_fragments": result.get("dfxml_fragments", {}),
+>>>>>>> ecec267 (feat: generate DFXML fragments per step during execution)
     }
 
 
