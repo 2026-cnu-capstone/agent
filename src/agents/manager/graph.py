@@ -428,11 +428,8 @@ async def run_report(
         "summary": result.get("summary", ""),
         "report": result.get("report", ""),
         "dfxml": result.get("dfxml", ""),
-<<<<<<< HEAD
-        "node_graph": graph,
-=======
         "dfxml_fragments": result.get("dfxml_fragments", {}),
->>>>>>> ecec267 (feat: generate DFXML fragments per step during execution)
+        "node_graph": graph,
     }
 
 
