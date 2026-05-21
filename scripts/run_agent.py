@@ -26,13 +26,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import structlog
 from docx import Document
 from docx.shared import Pt
 
-import structlog
-
 from agents.manager.graph import (
-    ExecutionCallback,
     create_manager_state,
     run_execution,
     run_planning,
@@ -41,12 +39,17 @@ from agents.manager.graph import (
 )
 from config import LLMProvider, load_settings
 from database.engine import get_engine, init_db
+from database.repository import create_case
 from disk_image_validator import validate_image_path
+from event_callback import PersistentExecutionCallback
+from event_store import AnalysisEventStore
 from llm_provider.anthropic import AnthropicProvider
 from llm_provider.base import BaseLLMProvider
 from llm_provider.openai import OpenAIProvider
 from mcp_client.client import MCPClientManager
-
+from rag.embedding import Embedder
+from rag.pgvector_store import PgVectorStore
+from rag.service import RAGService
 
 DIM = "\033[2m"
 BOLD = "\033[1m"
@@ -227,27 +230,54 @@ def create_llm_provider(settings, api_choice: str = "default") -> BaseLLMProvide
 
     Args:
         settings: 애플리케이션 설정
-        api_choice: "default" (기존 .env) 또는 "mindlogic" (MindLogic Gateway)
+        api_choice: "default", "anthropic", "anthropic_haiku", "mindlogic" 중 하나
     """
+    from config import LLMConfig
+
+    if api_choice == "anthropic":
+        config = LLMConfig(model=settings.anthropic_model)
+        return AnthropicProvider(config, api_key=settings.anthropic_api_key)
+
+    if api_choice == "anthropic_haiku":
+        config = LLMConfig(model=settings.light_llm.model)
+        return AnthropicProvider(config, api_key=settings.anthropic_api_key)
+
     if api_choice == "mindlogic":
-        from config import LLMConfig
-        mindlogic_config = LLMConfig(
+        config = LLMConfig(
             provider=LLMProvider.OPENAI,
             model=settings.mindlogic_model,
             base_url=settings.mindlogic_base_url,
         )
-        return OpenAIProvider(mindlogic_config, api_key=settings.mindlogic_api_key)
+        return OpenAIProvider(config, api_key=settings.mindlogic_api_key)
 
-    if settings.llm.provider == LLMProvider.OPENAI:
-        return OpenAIProvider(settings.llm, api_key=settings.llm_api_key)
-    return AnthropicProvider(settings.llm, api_key=settings.llm_api_key)
+    config = LLMConfig(
+        provider=LLMProvider.OPENAI,
+        model=settings.openai_model,
+    )
+    return OpenAIProvider(config, api_key=settings.openai_api_key)
 
 
 class ConsoleExecutionCallback:
-    """Sub-Agent 실행 진행 상황을 콘솔에 시각적으로 출력"""
+    """Sub-Agent 실행 진행 상황을 콘솔에 시각적으로 출력
 
-    def __init__(self) -> None:
+    persistent_cb가 설정되면 DB 영속화도 동시 수행
+
+    Attributes:
+        _step_starts: 단계별 시작 시각
+        _persistent_cb: DB 저장용 콜백 (None이면 콘솔만)
+    """
+
+    def __init__(
+        self,
+        persistent_cb: PersistentExecutionCallback | None = None,
+    ) -> None:
+        """ConsoleExecutionCallback 초기화
+
+        Args:
+            persistent_cb: DB 영속화 콜백 (None이면 콘솔 출력만)
+        """
         self._step_starts: dict[int, float] = {}
+        self._persistent_cb = persistent_cb
 
     def on_step_start(self, step_index: int, total: int, step: dict, agent_name: str) -> None:
         """단계 시작 시 진행 바와 단계 정보 출력"""
@@ -258,6 +288,9 @@ class ConsoleExecutionCallback:
         print(f"\n  {bar}")
         print_step_progress(step_index, total, name, agent_name, "running")
 
+        if self._persistent_cb:
+            self._persistent_cb.on_step_start(step_index, total, step, agent_name)
+
     def on_step_done(self, step_index: int, total: int, step: dict, agent_name: str, result: dict) -> None:
         """단계 완료 시 결과 요약 출력"""
         elapsed = _elapsed(self._step_starts.get(step_index, time.time()))
@@ -267,10 +300,16 @@ class ConsoleExecutionCallback:
 
         print_step_result(step_index, total, name, agent_name, status, output, elapsed)
 
+        if self._persistent_cb:
+            self._persistent_cb.on_step_done(step_index, total, step, agent_name, result)
+
     def on_step_skip(self, step_index: int, total: int, step: dict) -> None:
         """수동 단계 건너뛸 때 출력"""
         name = step.get("name", step.get("purpose", ""))
         print_step_progress(step_index, total, name, "manual", "skip")
+
+        if self._persistent_cb:
+            self._persistent_cb.on_step_skip(step_index, total, step)
 
     def _progress_bar(self, current: int, total: int) -> str:
         """텍스트 진행 바 생성"""
@@ -349,7 +388,7 @@ def save_report(
     return docx_path, dfxml_path
 
 
-async def run_strategy_hitl(state, llm) -> dict:
+async def run_strategy_hitl(state, llm, rag_service=None) -> dict:
     """전략 수립 HITL 루프
 
     LLM이 전략을 생성하고 사용자가 승인/수정할 때까지 반복
@@ -360,8 +399,12 @@ async def run_strategy_hitl(state, llm) -> dict:
     while True:
         start = time.time()
         print(f"  {DIM}LLM 호출 중...{RESET}", end="", flush=True)
-        current = await run_strategy(current, llm)
+        current = await run_strategy(current, llm, rag_service=rag_service)
         print(f"\r  {GREEN}전략 생성 완료{RESET} ({_elapsed(start)})")
+
+        rag_ctx = current.get("rag_context", "")
+        if rag_ctx:
+            print(f"\n  {BLUE}[RAG] 유사 사례 컨텍스트가 프롬프트에 주입됨 ({len(rag_ctx)}자){RESET}")
 
         strategy = current.get("analysis_strategy", "")
         print_section("분석 전략 (조사 대상 아티팩트)", strategy)
@@ -403,6 +446,10 @@ async def run_planning_hitl(state, llm, mcp) -> dict:
         print(f"  {DIM}LLM 호출 중...{RESET}", end="", flush=True)
         current = await run_planning(current, llm, mcp)
         print(f"\r  {GREEN}계획 생성 완료{RESET} ({_elapsed(start)})")
+
+        rag_ctx = current.get("rag_context", "")
+        if rag_ctx:
+            print(f"\n  {BLUE}[RAG] 유사 사례 컨텍스트가 프롬프트에 주입됨 ({len(rag_ctx)}자){RESET}")
 
         plan = current.get("analysis_plan", "")
         steps = current.get("plan_steps", [])
@@ -516,28 +563,52 @@ async def main() -> None:
     config_path = Path(__file__).parent.parent / "config" / "mcp_servers.json"
     settings = load_settings(config_path)
 
-    print(f"\n  {BOLD}API 선택{RESET}:")
-    print(f"    1. 기본 ({settings.llm.provider.value} / {settings.llm.model})")
+    has_default = bool(settings.openai_api_key)
+    has_anthropic = bool(settings.anthropic_api_key)
     has_mindlogic = bool(settings.mindlogic_api_key)
-    if has_mindlogic:
-        print(f"    2. MindLogic Gateway ({settings.mindlogic_model})")
+
+    print(f"\n  {BOLD}API 선택{RESET}:")
+    if has_default:
+        print(f"    1. OpenAI ({settings.openai_model})")
     else:
-        print(f"    {DIM}2. MindLogic Gateway (MINDLOGIC_API_KEY 미설정){RESET}")
+        print(f"    {DIM}1. OpenAI (OPENAI_API_KEY 미설정){RESET}")
+    if has_anthropic:
+        print(f"    2. Anthropic ({settings.anthropic_model})")
+        print(f"       {DIM}└ 경량 LLM: {settings.light_llm.model} (요약/변환용){RESET}")
+        print(f"    3. Anthropic 경량 ({settings.light_llm.model}) — 전 단계")
+    else:
+        print(f"    {DIM}2. Anthropic (ANTHROPIC_API_KEY 미설정){RESET}")
+        print(f"    {DIM}3. Anthropic 경량 (ANTHROPIC_API_KEY 미설정){RESET}")
+    if has_mindlogic:
+        print(f"    4. MindLogic Gateway ({settings.mindlogic_model})")
+        if has_anthropic:
+            print(f"       {DIM}└ 경량 LLM: {settings.light_llm.model} (요약/변환용){RESET}")
+    else:
+        print(f"    {DIM}4. MindLogic Gateway (MINDLOGIC_API_KEY 미설정){RESET}")
 
     api_choice = "default"
-    choice = input(f"  선택 (1/2, 기본=1) > ").strip()
-    if choice == "2" and has_mindlogic:
+    choice = input("  선택 (1/2/3/4, 기본=1) > ").strip()
+    if choice == "2" and has_anthropic:
+        api_choice = "anthropic"
+        print(f"  {GREEN}Anthropic API 사용{RESET}: {settings.anthropic_model}")
+    elif choice == "3" and has_anthropic:
+        api_choice = "anthropic_haiku"
+        print(f"  {GREEN}Anthropic 경량 사용{RESET}: {settings.light_llm.model} (전 단계)")
+    elif choice == "4" and has_mindlogic:
         api_choice = "mindlogic"
         print(f"  {GREEN}MindLogic Gateway 사용{RESET}: {settings.mindlogic_model}")
     else:
-        print(f"  {GREEN}기본 API 사용{RESET}: {settings.llm.provider.value} / {settings.llm.model}")
+        print(f"  {GREEN}OpenAI API 사용{RESET}: {settings.openai_model}")
 
     print(f"  {BOLD}MCP{RESET}:  {', '.join(settings.mcp.servers.keys()) or '(없음)'}")
 
-    if api_choice == "default" and not settings.llm_api_key:
-        print(f"  {RED}LLM_API_KEY가 설정되지 않았습니다.{RESET}")
+    if api_choice == "default" and not has_default:
+        print(f"  {RED}OPENAI_API_KEY가 설정되지 않았습니다.{RESET}")
         return
-    if api_choice == "mindlogic" and not settings.mindlogic_api_key:
+    if api_choice in ("anthropic", "anthropic_haiku") and not has_anthropic:
+        print(f"  {RED}ANTHROPIC_API_KEY가 설정되지 않았습니다.{RESET}")
+        return
+    if api_choice == "mindlogic" and not has_mindlogic:
         print(f"  {RED}MINDLOGIC_API_KEY가 설정되지 않았습니다.{RESET}")
         return
     if not settings.database_url:
@@ -546,9 +617,30 @@ async def main() -> None:
 
     db_engine = get_engine(settings.database_url)
     await init_db(db_engine)
+    event_store = AnalysisEventStore(db_engine)
     print(f"  {BOLD}DB{RESET}:   초기화 완료")
 
+    rag_service = None
+    if settings.rag.enabled:
+        print(f"  {DIM}RAG 임베딩 모델 로드 중...{RESET}", end="", flush=True)
+        embedder = Embedder(model_name=settings.rag.embedding_model)
+        store = PgVectorStore(engine=db_engine, embedder=embedder)
+        await store.ensure_extension()
+        rag_service = RAGService(
+            store=store,
+            top_k=settings.rag.search_top_k,
+            similarity_threshold=settings.rag.similarity_threshold,
+        )
+        print(f"\r  {GREEN}RAG 초기화 완료{RESET} (모델: {settings.rag.embedding_model})")
+
     llm = create_llm_provider(settings, api_choice)
+
+    light_llm: BaseLLMProvider | None = None
+    if api_choice == "anthropic_haiku":
+        pass
+    elif has_anthropic:
+        light_llm = AnthropicProvider(settings.light_llm, api_key=settings.anthropic_api_key)
+        print(f"  {BOLD}경량 LLM{RESET}: {settings.light_llm.model} (요약/변환용)")
 
     async with MCPClientManager(settings.mcp) as mcp:
         tools = await mcp.list_tools()
@@ -565,17 +657,17 @@ async def main() -> None:
         print(f"  {GREEN}이미지 등록{RESET}: {image_path} ({image_format.upper()})")
 
         system_profile = ""
-        print(f"  {DIM}시스템 프로필 추출 중...{RESET}", end="", flush=True)
+        print(f"  {DIM}타겟 열기 중...{RESET}", end="", flush=True)
         try:
             start = time.time()
-            profile_result = await mcp.call_tool(
-                "dissect__extract_system_profile",
-                {"image_path": image_path},
+            open_result = await mcp.call_tool(
+                "dissect__open_target",
+                {"path": image_path},
             )
-            system_profile = mcp.get_tool_result_text(profile_result)
-            print(f"\r  {GREEN}시스템 프로필 추출 완료{RESET} ({_elapsed(start)})")
+            system_profile = mcp.get_tool_result_text(open_result)
+            print(f"\r  {GREEN}타겟 열기 완료{RESET} ({_elapsed(start)})")
         except Exception as exc:
-            print(f"\r  {YELLOW}시스템 프로필 추출 실패: {exc}{RESET}")
+            print(f"\r  {YELLOW}타겟 열기 실패: {exc}{RESET}")
 
         while True:
             print("\n사건 개요를 입력하세요. (quit으로 종료)")
@@ -585,12 +677,33 @@ async def main() -> None:
                 break
 
             try:
+                from database.engine import get_session
+                from database.repository import create_case
+
+                case_id = None
+                try:
+                    async with get_session(db_engine) as session:
+                        case = await create_case(
+                            session,
+                            user_prompt=user_input,
+                            disk_image_path=image_path,
+                            disk_image_format=image_format,
+                        )
+                        case_id = case.id
+                    print(f"  {DIM}케이스 #{case_id} 생성{RESET}")
+                except Exception as exc:
+                    print(f"  {YELLOW}케이스 DB 저장 실패: {exc}{RESET}")
+
+                persistent_cb = PersistentExecutionCallback(event_store, case_id) if case_id else None
+
                 state = create_manager_state(
                     user_message=user_input,
                     disk_image_path=image_path,
                     disk_image_format=image_format,
                     system_profile=system_profile,
                 )
+                if case_id:
+                    state["case_id"] = case_id
 
                 cache_key = _cache_key(image_path, user_input) if args.use_cache else ""
 
@@ -600,7 +713,7 @@ async def main() -> None:
                     print(f"[Cache] 전략 캐시 적용 ({cache_key})")
                     print_section("분석 전략 (캐시)", state.get("analysis_strategy", ""))
                 else:
-                    state = await run_strategy_hitl(state, llm)
+                    state = await run_strategy_hitl(state, llm, rag_service=rag_service)
                     if cache_key:
                         _save_cache(cache_key, "strategy", {
                             "analysis_strategy": state.get("analysis_strategy", ""),
@@ -608,6 +721,11 @@ async def main() -> None:
                             "phase": "planning",
                         })
                         print(f"[Cache] 전략 캐시 저장 ({cache_key})")
+
+                await persistent_cb.emit_phase_event(
+                    "strategy_ready",
+                    {"strategy": state.get("analysis_strategy", "")[:500]},
+                )
 
                 accumulated_results = []
 
@@ -632,22 +750,30 @@ async def main() -> None:
                             cache_key = ""
 
                     steps = state.get("plan_steps", [])
+                    await persistent_cb.emit_phase_event(
+                        "plan_ready",
+                        {"total_steps": len(steps)},
+                    )
                     print_phase(3, f"Sub-Agent 실행 ({len(steps)}단계)")
 
                     exec_start = time.time()
-                    cb = ConsoleExecutionCallback()
-                    state = await run_execution(state, llm, mcp, callback=cb)
+                    cb = ConsoleExecutionCallback(persistent_cb=persistent_cb)
+                    state = await run_execution(state, llm, mcp, callback=cb, rag_service=rag_service, light_llm=light_llm, db_engine=db_engine)
 
                     task_results = state.get("task_results", [])
                     accumulated_results.extend(task_results)
 
+                    await persistent_cb.emit_phase_event(
+                        "execution_done",
+                        {"total_steps": len(steps), "elapsed": _elapsed(exec_start)},
+                    )
                     print(f"\n  {GREEN}실행 완료{RESET} ({_elapsed(exec_start)})")
                     print_results_table(task_results)
 
                     print_phase(4, "결과 요약")
                     start = time.time()
                     print(f"  {DIM}LLM 호출 중...{RESET}", end="", flush=True)
-                    report_result = await run_report(state, llm)
+                    report_result = await run_report(state, llm, light_llm=light_llm)
                     print(f"\r  {GREEN}요약 완료{RESET} ({_elapsed(start)})")
 
                     summary = report_result.get("summary", "")
@@ -664,7 +790,7 @@ async def main() -> None:
                         start = time.time()
                         print(f"  {DIM}LLM 호출 중...{RESET}", end="", flush=True)
                         state = {**state, "task_results": accumulated_results}
-                        report_result = await run_report(state, llm)
+                        report_result = await run_report(state, llm, light_llm=light_llm)
                         print(f"\r  {GREEN}보고서 생성 완료{RESET} ({_elapsed(start)})")
 
                         report = report_result.get("report", "")
@@ -672,6 +798,10 @@ async def main() -> None:
                         print_section("포렌식 분석 보고서", report)
 
                         docx_path, dfxml_path = save_report(report, dfxml)
+                        await persistent_cb.emit_phase_event(
+                            "report_ready",
+                            {"report_path": str(docx_path)},
+                        )
                         print(f"  {GREEN}보고서 저장{RESET}: {docx_path}")
                         if dfxml_path:
                             print(f"  {GREEN}DFXML 저장{RESET}: {dfxml_path}")
