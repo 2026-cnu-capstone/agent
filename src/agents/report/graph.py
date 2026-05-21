@@ -19,7 +19,7 @@ class ReportAgentState(TypedDict):
     """Sub-Agent들의 실행 결과 목록"""
 
     evidence_repository: list[dict[str, Any]]
-    """Sub-Agent별 DFXML 증거 프래그먼트 목록 (Evidence Repository)"""
+    """Sub-Agent별 증거 산출물 목록 (artifact + format 구조)"""
 
     case_description: str
     """사건 개요 텍스트"""
@@ -34,17 +34,24 @@ class ReportAgentState(TypedDict):
     """생성된 보고서 텍스트"""
 
     dfxml: str
-    """생성된 DFXML XML 문자열"""
+    """생성된 통합 DFXML XML 문자열"""
+
+    dfxml_fragments: dict[str, str]
+    """step별 개별 DFXML 프래그먼트 {task_id: dfxml_xml}"""
 
 
-def build_report_graph(llm: BaseLLMProvider) -> Any:
+def build_report_graph(
+    llm: BaseLLMProvider,
+    light_llm: BaseLLMProvider | None = None,
+) -> Any:
     """Report Agent subgraph 빌드
 
     그래프 토폴로지:
         START → summary → report → dfxml → END
 
     Args:
-        llm: LLM 프로바이더
+        llm: 메인 LLM 프로바이더 (summary, report 생성)
+        light_llm: 경량 LLM 프로바이더 (dfxml 변환, None이면 llm 사용)
 
     Returns:
         컴파일된 LangGraph subgraph
@@ -53,7 +60,7 @@ def build_report_graph(llm: BaseLLMProvider) -> Any:
 
     graph.add_node("summary", partial(summary_node, llm=llm))
     graph.add_node("report", partial(report_node, llm=llm))
-    graph.add_node("dfxml", partial(dfxml_node, llm=llm))
+    graph.add_node("dfxml", partial(dfxml_node, llm=light_llm or llm))
 
     graph.add_edge(START, "summary")
     graph.add_edge("summary", "report")
@@ -85,4 +92,5 @@ def create_report_state(
         summary="",
         report="",
         dfxml="",
+        dfxml_fragments={},
     )

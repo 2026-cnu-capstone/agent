@@ -12,13 +12,13 @@ DEFAULT_MAX_ROWS: int = 200
 MAX_ROWS_PER_PLUGIN: int = 50
 """다중 플러그인 동시 실행 시 플러그인당 최대 행 수"""
 
-SUMMARIZE_THRESHOLD: int = 5000
+SUMMARIZE_THRESHOLD: int = 15000
 """출력 요약을 적용하는 문자 수 임계치"""
 
-CHUNK_SIZE: int = 8000
+CHUNK_SIZE: int = 15000
 """Map-Reduce 청크당 최대 문자 수"""
 
-CHUNK_THRESHOLD: int = 20000
+CHUNK_THRESHOLD: int = 50000
 """Map-Reduce를 적용하는 출력 길이 임계치"""
 
 CALL_TOOL_TIMEOUT: int = 300

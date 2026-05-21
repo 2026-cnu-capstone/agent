@@ -74,11 +74,28 @@ class LLMConfig(BaseModel):
     base_url: str | None = None
 
 
+class RAGConfig(BaseModel):
+    """RAG 벡터스토어 설정
+
+    Attributes:
+        enabled: RAG 기능 활성화 여부
+        embedding_model: 임베딩 모델명 (HuggingFace 모델 ID)
+        search_top_k: 검색 시 반환할 최대 결과 수
+        similarity_threshold: 유사도 필터 임계값 (0.0~1.0)
+    """
+
+    enabled: bool = False
+    embedding_model: str = "BAAI/bge-m3"
+    search_top_k: int = 1
+    similarity_threshold: float = 0.7
+
+
 class Settings(BaseSettings):
     """애플리케이션 전체 설정
 
     환경변수 매핑:
-        LLM_API_KEY            → llm_api_key (기본 OpenAI)
+        OPENAI_API_KEY         → openai_api_key
+        ANTHROPIC_API_KEY      → anthropic_api_key (Anthropic 전용)
         LLM_MODEL              → llm.model (load_settings에서 처리)
         LLM_BASE_URL           → llm.base_url (load_settings에서 처리)
         MINDLOGIC_API_KEY      → mindlogic_api_key (MindLogic Gateway)
@@ -90,13 +107,28 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        env_nested_delimiter="__",
         extra="ignore",
     )
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    light_llm: LLMConfig = Field(
+        default_factory=lambda: LLMConfig(
+            provider=LLMProvider.ANTHROPIC,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4096,
+        ),
+        description="요약, DFXML 변환 등 단순 작업에 사용하는 경량 LLM",
+    )
     mcp: MCPConfig = Field(default_factory=MCPConfig)
+    rag: RAGConfig = Field(default_factory=RAGConfig)
 
-    llm_api_key: str = ""
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o"
+
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-4-20250514"
+
     llm_model: str = ""
     llm_base_url: str = ""
 

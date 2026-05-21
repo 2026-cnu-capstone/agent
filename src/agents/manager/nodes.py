@@ -12,6 +12,7 @@ import structlog
 from prompts.manager import build_planning_prompt, build_strategy_prompt
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
+from rag.service import RAGService
 from state.manager import ManagerState
 from state.messages import TaskAssignment
 
@@ -23,6 +24,7 @@ async def strategy_node(
     *,
     llm: BaseLLMProvider,
     system_profile: str = "",
+    rag_service: RAGService | None = None,
 ) -> dict[str, Any]:
     """사용자 사건 입력을 바탕으로 분석 전략 수립
 
@@ -30,22 +32,40 @@ async def strategy_node(
         state: Manager 상태
         llm: LLM 프로바이더
         system_profile: 디스크 이미지 시스템 프로필 (OS 정보 등)
+        rag_service: RAG 서비스 (None이면 RAG 비활성)
     """
     disk_image_format = state.get("disk_image_format", "")
+
+    rag_context = ""
+    if rag_service:
+        user_message = state["messages"][0].get("content", "") if state["messages"] else ""
+        if user_message:
+            results = await rag_service.search_similar_cases(user_message)
+            rag_context = RAGService.format_rag_context(results)
+            if results:
+                logger.info(
+                    "rag_strategy_injected",
+                    hits=len(results),
+                    top_score=results[0].score,
+                    context_length=len(rag_context),
+                )
+
     response = await llm.chat(
         messages=state["messages"],
         tools=None,
         system=build_strategy_prompt(
             disk_image_format=disk_image_format,
             system_profile=system_profile,
+            rag_context=rag_context,
         ),
     )
     strategy_text = response.content if isinstance(response.content, str) else ""
-    logger.info("strategy_created", length=len(strategy_text))
+    logger.info("strategy_created", length=len(strategy_text), rag_hits=bool(rag_context))
 
     return {
         "messages": [{"role": "assistant", "content": response.content}],
         "analysis_strategy": strategy_text,
+        "rag_context": rag_context,
         "phase": "planning",
     }
 
@@ -58,6 +78,9 @@ async def planning_node(
 ) -> dict[str, Any]:
     """수립된 전략을 바탕으로 세부 실행 계획 수립
 
+    strategy_node에서 저장된 rag_context를 재사용하여
+    중복 RAG 검색을 방지
+
     Args:
         state: Manager 상태
         llm: LLM 프로바이더
@@ -66,9 +89,22 @@ async def planning_node(
     server_names = mcp.connected_servers
     server_list = "\n".join(f"- {name}" for name in server_names) if server_names else ""
 
-    messages = list(state["messages"])
-    if messages and messages[-1].get("role") == "assistant":
-        messages.append({"role": "user", "content": "위 전략을 바탕으로 세부 실행 계획을 수립해주세요."})
+    rag_context = state.get("rag_context", "")
+
+    incoming_messages = state.get("messages", [])
+    has_feedback = (
+        len(incoming_messages) == 1
+        and "[수정 요청]" in incoming_messages[0].get("content", "")
+    )
+
+    if has_feedback:
+        messages = list(incoming_messages)
+    else:
+        strategy_text = state.get("analysis_strategy", "")
+        messages = [
+            {"role": "user", "content": strategy_text},
+            {"role": "user", "content": "위 전략을 바탕으로 세부 실행 계획을 수립해주세요."},
+        ]
 
     response = await llm.chat(
         messages=messages,
@@ -76,6 +112,7 @@ async def planning_node(
         system=build_planning_prompt(
             state.get("analysis_strategy", ""),
             server_list,
+            rag_context=rag_context,
         ),
     )
     plan_text = response.content if isinstance(response.content, str) else ""
@@ -104,8 +141,8 @@ def routing_node(state: ManagerState) -> dict[str, Any]:
     context = ""
     if task_results:
         context = "\n".join(
-            f"[{r['agent_name']}] {r['output'][:500]}"
-            for r in task_results[-3:]
+            f"[{r['agent_name']}] {r['output'][:300]}"
+            for r in task_results[-2:]
         )
 
     task_queue: list[TaskAssignment] = []
