@@ -32,7 +32,7 @@ from agents.manager.graph import (
 )
 from config import LLMProvider, load_settings
 from database.engine import get_engine, init_db
-from database.repository import create_case
+from database.repository import create_case, update_case_analysis_info
 from llm_provider.base import BaseLLMProvider
 from llm_provider.openai import OpenAIProvider
 from llm_provider.anthropic import AnthropicProvider
@@ -313,14 +313,23 @@ async def start_analysis(case_id: str, disk_image_path: str, prompt: str) -> dic
         try:
             from database.engine import get_session
             async with get_session(db_engine) as session:
-                ext = Path(disk_image_path).suffix.lstrip(".").lower() or "unknown"
-                db_case = await create_case(
+                # case_id가 DB에 이미 존재하면 분석 정보 업데이트, 없으면 새로 생성
+                updated = await update_case_analysis_info(
                     session,
+                    case_id=case_id,
                     user_prompt=prompt,
                     disk_image_path=disk_image_path,
-                    disk_image_format=ext if ext in ("e01", "dd", "raw") else "unknown",
                 )
-                state["case_id"] = db_case.id
+                if updated is None:
+                    db_case = await create_case(
+                        session,
+                        title=f"케이스 - {Path(disk_image_path).name}",
+                        user_prompt=prompt,
+                        disk_image_path=disk_image_path,
+                    )
+                    state["case_id"] = db_case.id
+                else:
+                    state["case_id"] = case_id
         except Exception:
             pass
 
