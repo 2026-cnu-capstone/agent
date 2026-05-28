@@ -37,7 +37,7 @@ DATABASE_URL=postgresql+asyncpg://forensic_ai:<PASSWORD>@<DB_SERVER_IP>:5432/for
 | 항목 | 값 |
 |------|-----|
 | 이메일 | `admin@forensic.ai` |
-| 비밀번호 | `forensic_ai` |
+| 비밀번호 | 팀 단톡 참고 |
 
 **처음 접속 시 서버 등록 (1회만):**
 1. 왼쪽 `Servers` 우클릭 → `Register` → `Server`
