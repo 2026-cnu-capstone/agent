@@ -47,7 +47,7 @@ DATABASE_URL=postgresql+asyncpg://forensic_ai:<PASSWORD>@168.107.39.168:5432/for
    - 포트: `5432`
    - 데이터베이스: `forensic_ai`
    - 사용자명: `forensic_ai`
-   - 비밀번호: `forensic_ai`
+   - 비밀번호: 팀 단톡 참고
 4. 저장
 
 등록 후 `forensic_ai` → `Databases` → `forensic_ai` → `Schemas` → `Tables` 에서 테이블과 데이터를 볼 수 있습니다.
