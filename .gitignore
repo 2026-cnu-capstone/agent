@@ -37,6 +37,7 @@ uv.lock
 
 # Config
 config/mcp_servers.json
+docker-compose.yml
 
 # Test cache
 .cache/
