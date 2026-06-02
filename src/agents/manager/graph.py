@@ -125,6 +125,7 @@ async def run_execution(
     rag_service: RAGService | None = None,
     light_llm: BaseLLMProvider | None = None,
     db_engine: Any | None = None,
+    cancel_check: Any | None = None,
 ) -> ManagerState:
     """Sub-Agent 실행 단계
 
@@ -200,6 +201,9 @@ async def run_execution(
     i = 0
 
     while i < len(plan_steps):
+        if cancel_check and cancel_check():
+            logger.info("execution_cancelled", step_index=i)
+            break
         step = plan_steps[i]
         if i > 0:
             await asyncio.sleep(EXECUTION_STEP_DELAY)
