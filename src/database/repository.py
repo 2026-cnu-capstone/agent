@@ -15,6 +15,7 @@ from database.models import (
     Case,
     DfxmlFragment,
     PlanStep,
+    Report,
     TaskResult,
 )
 
@@ -225,6 +226,27 @@ async def save_event(
     await session.commit()
     await session.refresh(event)
     return event
+
+
+async def create_report(
+    session: AsyncSession,
+    case_id: str,
+    summary: str | None = None,
+    report_text: str | None = None,
+    dfxml: str | None = None,
+    status: str = "done",
+) -> Report:
+    report = Report(
+        case_id=case_id,
+        summary=summary,
+        report_text=report_text,
+        dfxml=dfxml,
+        status=status,
+    )
+    session.add(report)
+    await session.commit()
+    await session.refresh(report)
+    return report
 
 
 async def get_events_after(
