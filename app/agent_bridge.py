@@ -32,7 +32,7 @@ from agents.manager.graph import (
 )
 from config import LLMProvider, load_settings
 from database.engine import get_engine, init_db
-from database.repository import create_case, update_case_analysis_info
+from database.repository import create_case, update_case_analysis_info, update_case_status
 from llm_provider.base import BaseLLMProvider
 from llm_provider.openai import OpenAIProvider
 from llm_provider.anthropic import AnthropicProvider
@@ -79,6 +79,7 @@ async def get_db_engine():
     engine = get_engine(settings.database_url)
     await init_db(engine)
     _db_engine = engine
+    ws_manager.set_engine(engine)
     return engine
 
 
@@ -443,7 +444,13 @@ async def execute_analysis(case_id: str) -> dict[str, Any]:
     db_engine = await get_db_engine()
     callback = WebSocketExecutionCallback(case_id)
 
-    state = await run_execution(state, llm, mcp, callback=callback, rag_service=rag, db_engine=db_engine)
+    state = await run_execution(
+        state, llm, mcp,
+        callback=callback,
+        rag_service=rag,
+        db_engine=db_engine,
+        cancel_check=lambda: is_cancelled(case_id),
+    )
     _analysis_states[case_id] = state
     clear_cancel(case_id)
 
@@ -469,6 +476,26 @@ async def generate_report(case_id: str) -> dict[str, str]:
         "report": result.get("report", ""),
         "dfxml": result.get("dfxml", ""),
     }
+
+    db_engine = await get_db_engine()
+    if db_engine:
+        try:
+            from database.engine import get_session
+            from database.repository import create_report
+            async with get_session(db_engine) as session:
+                await create_report(
+                    session,
+                    case_id=case_id,
+                    summary=report_result["summary"],
+                    report_text=report_result["report"],
+                    dfxml=report_result["dfxml"],
+                )
+            async with get_session(db_engine) as session:
+                await update_case_status(session, case_id, "done")
+        except Exception as exc:
+            import logging
+            logging.getLogger("agent_bridge").warning("report_save_failed: %s", exc)
+
     if node_graph:
         report_result["node_graph"] = get_graph_response(node_graph)
     cleanup_session(case_id)
