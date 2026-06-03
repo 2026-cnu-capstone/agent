@@ -81,7 +81,7 @@ class PgVectorStore(BaseVectorStore):
                 stmt = stmt.where(CaseEmbedding.phase == query.filters["phase"])
             if "case_id" in query.filters:
                 stmt = stmt.where(
-                    CaseEmbedding.case_id == int(query.filters["case_id"])
+                    CaseEmbedding.case_id == query.filters["case_id"]
                 )
 
             result = await session.execute(stmt)
@@ -131,7 +131,7 @@ class PgVectorStore(BaseVectorStore):
 
         async with get_session(self.engine) as session:
             record = CaseEmbedding(
-                case_id=int(meta.get("case_id", 0)),
+                case_id=meta.get("case_id") or None,
                 phase=meta.get("phase", "unknown"),
                 content=content,
                 embedding=embedding,
