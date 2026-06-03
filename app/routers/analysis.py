@@ -9,6 +9,7 @@ from app.agent_bridge import (
     approve_strategy,
     execute_analysis,
     generate_report,
+    get_db_engine,
     get_node_graph,
     get_session_status,
     request_cancel,
@@ -18,6 +19,18 @@ from app.models import AnalysisRequest, PlanApproval, StrategyApproval
 from app.ws_manager import manager as ws_manager
 
 router = APIRouter(prefix="/api/analysis", tags=["analysis"])
+
+
+async def _mark_case_failed(case_id: str) -> None:
+    try:
+        from database.engine import get_session
+        from database.repository import update_case_status
+        engine = await get_db_engine()
+        if engine:
+            async with get_session(engine) as session:
+                await update_case_status(session, case_id, "failed")
+    except Exception:
+        pass
 
 
 @router.post("/start")
@@ -76,6 +89,7 @@ async def api_execute_analysis(case_id: str):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        await _mark_case_failed(case_id)
         await ws_manager.send_event(case_id, "error", {"message": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -84,6 +98,15 @@ async def api_execute_analysis(case_id: str):
 async def api_pause_analysis(case_id: str):
     """실행 중단 요청"""
     request_cancel(case_id)
+    try:
+        from database.engine import get_session
+        from database.repository import update_case_status
+        engine = await get_db_engine()
+        if engine:
+            async with get_session(engine) as session:
+                await update_case_status(session, case_id, "open")
+    except Exception:
+        pass
     return {"status": "paused"}
 
 
@@ -97,6 +120,7 @@ async def api_generate_report(case_id: str):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        await _mark_case_failed(case_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 

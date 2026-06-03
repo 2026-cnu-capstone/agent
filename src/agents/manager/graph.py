@@ -19,7 +19,13 @@ from agents.manager.nodes import (
 from agents.report.graph import build_report_graph, create_report_state
 from constants import EXECUTION_STEP_DELAY, MAX_FOLLOWUP_STEPS
 from database.engine import get_session
-from database.repository import create_agent_run, create_step_result, update_agent_run
+from database.repository import (
+    create_agent_run,
+    create_analysis_session,
+    create_plan_step,
+    create_task_result,
+    update_agent_run,
+)
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
 from node_graph import (
@@ -119,6 +125,7 @@ async def run_execution(
     rag_service: RAGService | None = None,
     light_llm: BaseLLMProvider | None = None,
     db_engine: Any | None = None,
+    cancel_check: Any | None = None,
 ) -> ManagerState:
     """Sub-Agent 실행 단계
 
@@ -146,18 +153,38 @@ async def run_execution(
     if registry is None:
         registry = create_default_registry(light_llm=light_llm)
 
-    agent_run_id: int | None = None
+    db_session_id: int | None = None
+    db_plan_step_ids: dict[int, int] = {}  # step_index → plan_step.id
+
+    plan_steps = list(state.get("plan_steps", []))
+
     if db_engine and state.get("case_id"):
         try:
             async with get_session(db_engine) as session:
-                agent_run = await create_agent_run(
-                    session, state["case_id"], "execution"
+                analysis_session = await create_analysis_session(
+                    session,
+                    case_id=state["case_id"],
+                    phase="execute",
+                    system_profile=state.get("system_profile"),
+                    strategy=state.get("analysis_strategy"),
+                    plan_text=state.get("analysis_plan"),
                 )
-                agent_run_id = agent_run.id
+                db_session_id = analysis_session.id
+                for idx, step in enumerate(plan_steps):
+                    ps = await create_plan_step(
+                        session,
+                        session_id=db_session_id,
+                        case_id=state["case_id"],
+                        step_index=idx,
+                        mcp_server=step.get("mcp_server"),
+                        purpose=step.get("purpose"),
+                        hints=step.get("hints"),
+                        artifacts=step.get("artifacts") if isinstance(step.get("artifacts"), dict) else None,
+                    )
+                    db_plan_step_ids[idx] = ps.id
         except Exception as exc:
-            logger.warning("agent_run_create_failed", error=str(exc))
+            logger.warning("db_execution_setup_failed", error=str(exc))
 
-    plan_steps = list(state.get("plan_steps", []))
     disk_image_path = state.get("disk_image_path") or ""
     results: list[TaskResult] = list(state.get("task_results", []))
     evidence_repo: list[dict[str, Any]] = []
@@ -174,6 +201,9 @@ async def run_execution(
     i = 0
 
     while i < len(plan_steps):
+        if cancel_check and cancel_check():
+            logger.info("execution_cancelled", step_index=i)
+            break
         step = plan_steps[i]
         if i > 0:
             await asyncio.sleep(EXECUTION_STEP_DELAY)
@@ -299,16 +329,43 @@ async def run_execution(
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
 
-        if db_engine and agent_run_id:
+        if db_engine and db_session_id and state.get("case_id"):
             try:
+                # followup 스텝은 실행 중 동적으로 plan_step 레코드 생성
+                if i not in db_plan_step_ids:
+                    async with get_session(db_engine) as session:
+                        ps = await create_plan_step(
+                            session,
+                            session_id=db_session_id,
+                            case_id=state["case_id"],
+                            step_index=i,
+                            mcp_server=step.get("mcp_server"),
+                            purpose=step.get("purpose"),
+                            hints=step.get("hints"),
+                            is_followup=True,
+                        )
+                        db_plan_step_ids[i] = ps.id
+
                 async with get_session(db_engine) as session:
-                    await create_step_result(
+                    agent_run_rec = await create_agent_run(
                         session,
-                        agent_run_id=agent_run_id,
-                        step_index=i,
-                        tool_name=last_result.get("agent_name", ""),
-                        output_summary=last_result.get("output", "")[:500],
-                        raw_output=last_result.get("output", ""),
+                        session_id=db_session_id,
+                        plan_step_id=db_plan_step_ids[i],
+                        agent_name=last_result.get("agent_name", agent_name),
+                        tool=step.get("tool"),
+                    )
+                    await update_agent_run(
+                        session,
+                        agent_run_rec.id,
+                        status=last_result.get("status", "error"),
+                    )
+                    await create_task_result(
+                        session,
+                        agent_run_id=agent_run_rec.id,
+                        case_id=state["case_id"],
+                        task_id=last_result.get("task_id", task["task_id"]),
+                        status=last_result.get("status", "error"),
+                        output=last_result.get("output", ""),
                         dfxml_fragment=dfxml_frag if last_result.get("status") == "success" else "",
                     )
             except Exception as exc:
@@ -348,18 +405,6 @@ async def run_execution(
             )
 
         i += 1
-
-    if db_engine and agent_run_id:
-        has_error = any(r.get("status") == "error" for r in results)
-        try:
-            async with get_session(db_engine) as session:
-                await update_agent_run(
-                    session,
-                    agent_run_id,
-                    status="error" if has_error else "success",
-                )
-        except Exception as exc:
-            logger.warning("agent_run_update_failed", error=str(exc))
 
     if rag_service and state.get("case_id"):
         results_summary = "\n".join(

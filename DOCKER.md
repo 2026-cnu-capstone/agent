@@ -11,7 +11,7 @@
 `agent/.env` 파일을 열고 `DATABASE_URL`을 아래로 설정하세요.
 
 ```
-DATABASE_URL=postgresql+asyncpg://forensic_ai:forensic_ai@168.107.39.168:5432/forensic_ai
+DATABASE_URL=postgresql+asyncpg://forensic_ai:<PASSWORD>@168.107.39.168:5432/forensic_ai
 ```
 
 ---
@@ -24,7 +24,7 @@ DATABASE_URL=postgresql+asyncpg://forensic_ai:forensic_ai@168.107.39.168:5432/fo
 | Port | `5432` |
 | Database | `forensic_ai` |
 | User | `forensic_ai` |
-| Password | `forensic_ai` |
+| Password | 팀 단톡 참고 |
 
 ---
 
@@ -37,7 +37,7 @@ DATABASE_URL=postgresql+asyncpg://forensic_ai:forensic_ai@168.107.39.168:5432/fo
 | 항목 | 값 |
 |------|-----|
 | 이메일 | `admin@forensic.ai` |
-| 비밀번호 | `forensic_ai` |
+| 비밀번호 | 팀 단톡 참고 |
 
 **처음 접속 시 서버 등록 (1회만):**
 1. 왼쪽 `Servers` 우클릭 → `Register` → `Server`
@@ -47,7 +47,7 @@ DATABASE_URL=postgresql+asyncpg://forensic_ai:forensic_ai@168.107.39.168:5432/fo
    - 포트: `5432`
    - 데이터베이스: `forensic_ai`
    - 사용자명: `forensic_ai`
-   - 비밀번호: `forensic_ai`
+   - 비밀번호: 팀 단톡 참고
 4. 저장
 
 등록 후 `forensic_ai` → `Databases` → `forensic_ai` → `Schemas` → `Tables` 에서 테이블과 데이터를 볼 수 있습니다.
@@ -61,7 +61,7 @@ import asyncio, asyncpg
 
 async def check():
     conn = await asyncpg.connect(
-        "postgresql://forensic_ai:forensic_ai@168.107.39.168:5432/forensic_ai"
+        "postgresql://forensic_ai:<PASSWORD>@168.107.39.168:5432/forensic_ai"
     )
     rows = await conn.fetch("SELECT * FROM cases ORDER BY created_at DESC LIMIT 10")
     for r in rows:
