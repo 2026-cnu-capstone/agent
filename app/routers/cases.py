@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.models import (
@@ -17,6 +18,32 @@ router = APIRouter()
 
 # DB 없을 때 fallback용 인메모리 스토어
 _cases: dict[str, Case] = {}
+
+
+class WorkflowNodeIn(BaseModel):
+    """React Flow 노드 위치/메타 (workflow_nodes)"""
+
+    node_id: str
+    x: float
+    y: float
+    label: str | None = None
+    node_type: str | None = None
+    status: str | None = None
+
+
+class WorkflowEdgeIn(BaseModel):
+    """React Flow 엣지 (workflow_edges)"""
+
+    edge_id: str
+    source_node: str
+    target_node: str
+
+
+class WorkflowSaveReq(BaseModel):
+    """캔버스 전체 저장 요청 (노드/엣지 통째로 교체)"""
+
+    nodes: list[WorkflowNodeIn] = []
+    edges: list[WorkflowEdgeIn] = []
 
 
 def _db_case_to_response(db_case) -> Case:
@@ -284,3 +311,81 @@ async def create_case(data: CaseCreate):
     )
     _cases[case.id] = case
     return case
+
+
+@router.get("/cases/{case_id}/workflow")
+async def get_workflow(case_id: str):
+    """저장된 캔버스 노드 위치/엣지 조회 (없으면 빈 배열)"""
+    from sqlalchemy import text
+
+    from app.agent_bridge import get_db_engine
+    from database.engine import get_session
+
+    engine = await get_db_engine()
+    if engine is None:
+        return {"nodes": [], "edges": []}
+
+    async with get_session(engine) as session:
+        nodes = (await session.execute(
+            text(
+                "SELECT node_id, x, y, label, node_type, status "
+                "FROM workflow_nodes WHERE case_id = :cid ORDER BY id"
+            ),
+            {"cid": case_id},
+        )).mappings().all()
+        edges = (await session.execute(
+            text(
+                "SELECT edge_id, source_node, target_node "
+                "FROM workflow_edges WHERE case_id = :cid ORDER BY id"
+            ),
+            {"cid": case_id},
+        )).mappings().all()
+        return {"nodes": [dict(n) for n in nodes], "edges": [dict(e) for e in edges]}
+
+
+@router.put("/cases/{case_id}/workflow")
+async def save_workflow(case_id: str, body: WorkflowSaveReq):
+    """캔버스 노드/엣지 통째로 저장 (해당 case 기존 행을 교체, 원자적)"""
+    from sqlalchemy import text
+
+    from app.agent_bridge import get_db_engine
+    from database.engine import get_session
+
+    engine = await get_db_engine()
+    if engine is None:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+
+    async with get_session(engine) as session:
+        exists = (await session.execute(
+            text("SELECT 1 FROM cases WHERE id = :cid"), {"cid": case_id}
+        )).first()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+
+        # 같은 트랜잭션에서 전량 교체 → 노드 추가/삭제/이동 모두 반영
+        await session.execute(
+            text("DELETE FROM workflow_nodes WHERE case_id = :cid"), {"cid": case_id}
+        )
+        await session.execute(
+            text("DELETE FROM workflow_edges WHERE case_id = :cid"), {"cid": case_id}
+        )
+        for n in body.nodes:
+            await session.execute(
+                text(
+                    "INSERT INTO workflow_nodes "
+                    "(case_id, node_id, x, y, label, node_type, status) "
+                    "VALUES (:cid, :node_id, :x, :y, :label, :node_type, :status)"
+                ),
+                {"cid": case_id, **n.model_dump()},
+            )
+        for e in body.edges:
+            await session.execute(
+                text(
+                    "INSERT INTO workflow_edges "
+                    "(case_id, edge_id, source_node, target_node) "
+                    "VALUES (:cid, :edge_id, :source_node, :target_node)"
+                ),
+                {"cid": case_id, **e.model_dump()},
+            )
+        await session.commit()
+        return {"nodes": len(body.nodes), "edges": len(body.edges)}
