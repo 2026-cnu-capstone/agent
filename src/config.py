@@ -129,6 +129,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-20250514"
 
+    llm_api_key: str = ""
     llm_model: str = ""
     llm_base_url: str = ""
 
