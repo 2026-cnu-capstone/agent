@@ -194,3 +194,17 @@ CREATE TABLE IF NOT EXISTS case_embedding (
 );
 
 CREATE INDEX ON case_embedding USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+-- ─────────────────────────────────────────
+-- analysis_event  (cases 1:N · WebSocket 이벤트 영속화)
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS analysis_event (
+  id          SERIAL       PRIMARY KEY,
+  case_id     VARCHAR(36)  NOT NULL REFERENCES cases(id),
+  event_type  VARCHAR(50)  NOT NULL,
+  payload     JSONB        NOT NULL DEFAULT '{}',
+  created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX ON analysis_event(case_id);
+CREATE INDEX ON analysis_event(event_type);
