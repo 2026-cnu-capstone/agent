@@ -10,7 +10,6 @@ from typing import Any
 import structlog
 from langgraph.graph import END, START, StateGraph
 
-from llm_provider.anthropic import AnthropicProvider
 from llm_provider.base import BaseLLMProvider, ToolResult
 from llm_provider.tool_converter import mcp_tools_to_anthropic, mcp_tools_to_openai
 from constants import DEFAULT_MAX_ITERATIONS
@@ -46,7 +45,7 @@ async def sub_agent_llm_node(
     else:
         tools = await mcp.list_tools()
 
-    if isinstance(llm, AnthropicProvider):
+    if llm.is_anthropic:
         tool_params = mcp_tools_to_anthropic(tools)
     else:
         tool_params = mcp_tools_to_openai(tools)
@@ -57,7 +56,7 @@ async def sub_agent_llm_node(
         system=system_prompt,
     )
 
-    if isinstance(llm, AnthropicProvider):
+    if llm.is_anthropic:
         content_blocks = []
         if response.content:
             content_blocks.append({"type": "text", "text": response.content})
@@ -137,7 +136,7 @@ async def sub_agent_tool_node(
             )
         )
 
-    if isinstance(llm, AnthropicProvider):
+    if llm.is_anthropic:
         tool_messages: list[dict[str, Any]] = [
             {
                 "role": "user",
@@ -195,17 +194,33 @@ async def sub_agent_finalize_node(
                 last_content = content
                 break
 
-    valid_chunks = [c for c in chunks if not _is_error_chunk(c)]
-    error_chunks = [c for c in chunks if _is_error_chunk(c)]
+    non_blank = [c for c in chunks if c and c.strip()]
+    valid_chunks = [c for c in non_blank if not _is_error_chunk(c)]
+    error_chunks = [c for c in non_blank if _is_error_chunk(c)]
 
     if last_content:
         output = last_content
     elif valid_chunks:
         output = "\n---\n".join(valid_chunks)
     else:
-        output = "\n---\n".join(chunks) if chunks else ""
+        output = "\n---\n".join(non_blank) if non_blank else ""
 
     has_error = bool(error_chunks) and not valid_chunks and not last_content
+
+    if not output.strip():
+        has_error = True
+        output = (
+            "단계가 산출물을 만들지 못했습니다. "
+            f"(도구 호출 {len(chunks)}건, 오류 응답 {len(error_chunks)}건, "
+            "LLM 최종 응답 없음)"
+        )
+        logger.warning(
+            "sub_agent_empty_output",
+            task_id=task["task_id"],
+            agent=task["agent_name"],
+            chunks=len(chunks),
+            error_chunks=len(error_chunks),
+        )
 
     result: TaskResultType = {
         "task_id": task["task_id"],
