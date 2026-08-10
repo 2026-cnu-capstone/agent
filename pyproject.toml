@@ -39,11 +39,11 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mcp_client", "src/llm_provider", "src/prompts", "src/database", "src/agents", "src/state", "src/output", "src/rag"]
+packages = ["src/mcp_client", "src/llm_provider", "src/prompts", "src/database", "src/agents", "src/state", "src/output", "src/rag", "src/discovery"]
 sources = ["src"]
 
 [tool.hatch.build.targets.editable]
-packages = ["src/mcp_client", "src/llm_provider", "src/prompts", "src/database", "src/agents", "src/state", "src/output", "src/rag"]
+packages = ["src/mcp_client", "src/llm_provider", "src/prompts", "src/database", "src/agents", "src/state", "src/output", "src/rag", "src/discovery"]
 sources = ["src"]
 
 [tool.pytest.ini_options]

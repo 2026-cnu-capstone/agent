@@ -62,6 +62,27 @@ class LLMProvider(str, Enum):
 
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
+    CLAUDE_CODE = "claude_code"
+
+
+class ClaudeCodeConfig(BaseModel):
+    """Claude Code 헤드리스 CLI 실행 설정
+
+    Attributes:
+        cli_path: claude 실행 파일 경로 또는 이름
+        timeout: 단일 호출 타임아웃 (초)
+        max_turns: 헤드리스 세션당 최대 턴 수
+        isolate_tools: 내장 도구와 사용자 전역 MCP 서버를 차단할지 여부.
+            비활성화하면 포렌식 분석 중 사용자의 개인 MCP 서버가 호출될 수
+            있으므로 기본값 유지 권장
+        extra_args: claude CLI에 추가로 전달할 인자
+    """
+
+    cli_path: str = "claude"
+    timeout: float = 600.0
+    max_turns: int = 1
+    isolate_tools: bool = True
+    extra_args: list[str] = Field(default_factory=list)
 
 
 class LLMConfig(BaseModel):
@@ -90,6 +111,22 @@ class RAGConfig(BaseModel):
     similarity_threshold: float = 0.7
 
 
+class DiscoveryConfig(BaseModel):
+    """포렌식 도구 탐지 및 MCP 추천 설정
+
+    Attributes:
+        search_roots: PATH 밖의 MCP 서버 실행 파일을 찾을 루트 디렉터리 목록
+        use_public_registry: 공개 MCP 레지스트리 조회 활성화 여부
+        registry_timeout: 레지스트리 단일 요청 타임아웃 (초)
+        verify_timeout: MCP 서버 동작 검증 핸드셰이크 타임아웃 (초)
+    """
+
+    search_roots: list[str] = Field(default_factory=list)
+    use_public_registry: bool = True
+    registry_timeout: float = 5.0
+    verify_timeout: float = 20.0
+
+
 class Settings(BaseSettings):
     """애플리케이션 전체 설정
 
@@ -102,6 +139,7 @@ class Settings(BaseSettings):
         MINDLOGIC_BASE_URL     → mindlogic_base_url
         MINDLOGIC_MODEL        → mindlogic_model
         DATABASE_URL           → database_url
+        DISCOVERY_SEARCH_ROOTS → discovery.search_roots (load_settings에서 처리)
     """
 
     model_config = SettingsConfigDict(
@@ -122,6 +160,8 @@ class Settings(BaseSettings):
     )
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     rag: RAGConfig = Field(default_factory=RAGConfig)
+    discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
+    claude_code: ClaudeCodeConfig = Field(default_factory=ClaudeCodeConfig)
 
     openai_api_key: str = ""
     openai_model: str = "gpt-4o"
@@ -138,6 +178,18 @@ class Settings(BaseSettings):
     mindlogic_model: str = "claude-sonnet-4-6"
 
     database_url: str = ""
+
+    discovery_search_roots: str = ""
+    """MCP 서버 탐색 루트 (PATH처럼 `:` 구분, 예: ~/Documents/3-Project)"""
+
+    llm_mode: str = ""
+    """실행 모드 강제 지정 (`claude_code`면 헤드리스 CLI 사용)"""
+
+    claude_code_model: str = "claude-sonnet-4-5-20250929"
+    """Claude Code 헤드리스 모드에서 사용할 모델"""
+
+    claude_code_light_model: str = "claude-haiku-4-5-20251001"
+    """Claude Code 헤드리스 모드의 경량 작업용 모델"""
 
 
 def _load_mcp_from_json(path: Path) -> MCPConfig:
@@ -213,8 +265,22 @@ def load_settings(config_path: Path | None = None) -> Settings:
     if settings.llm_base_url:
         settings.llm.base_url = settings.llm_base_url
 
+    if settings.discovery_search_roots:
+        settings.discovery.search_roots = [
+            entry.strip()
+            for entry in settings.discovery_search_roots.split(":")
+            if entry.strip()
+        ]
+
     model = settings.llm.model.lower()
     if model.startswith(("gpt", "o1", "o3")) or settings.llm.base_url:
         settings.llm.provider = LLMProvider.OPENAI
+
+    if settings.llm_mode.strip().lower() == LLMProvider.CLAUDE_CODE.value:
+        settings.llm.provider = LLMProvider.CLAUDE_CODE
+        settings.llm.model = settings.claude_code_model
+        settings.llm.base_url = None
+        settings.light_llm.provider = LLMProvider.CLAUDE_CODE
+        settings.light_llm.model = settings.claude_code_light_model
 
     return settings
