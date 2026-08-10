@@ -120,6 +120,7 @@ async def planning_node(
             state.get("analysis_strategy", ""),
             server_list,
             rag_context=rag_context,
+            system_profile=state.get("system_profile") or "",
         ),
     )
     plan_text = response.content if isinstance(response.content, str) else ""
