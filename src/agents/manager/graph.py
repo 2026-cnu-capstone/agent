@@ -6,17 +6,22 @@ HITL 게이트는 run_agent.py에서 명시적으로 제어하므로,
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Protocol
 
 import structlog
+from pydantic import ValidationError
 
 from agents.factory import AgentRegistry, create_default_registry
 from agents.manager.nodes import (
     _extract_agent_name,
+    discovery_node,
+    hitl_mcp_install_gate,
     planning_node,
     strategy_node,
 )
 from agents.report.graph import build_report_graph, create_report_state
+from config import DiscoveryConfig, MCPConfig
 from constants import EXECUTION_STEP_DELAY, MAX_FOLLOWUP_STEPS
 from database.engine import get_session
 from database.repository import (
@@ -24,8 +29,13 @@ from database.repository import (
     create_analysis_session,
     create_plan_step,
     create_task_result,
+    save_workflow_graph,
     update_agent_run,
+    update_analysis_session,
 )
+from discovery.installer import MCPInstaller
+from discovery.proposal import apply_proposals
+from discovery.types import InstallOutcome, MCPRecommendation, ServerProposal
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
 from node_graph import (
@@ -87,6 +97,140 @@ async def run_strategy(
         graph, new_state.get("analysis_strategy", "")
     )
     return new_state
+
+
+async def run_discovery(
+    state: ManagerState,
+    mcp_config: MCPConfig | None = None,
+    config_path: Path | None = None,
+    discovery_config: DiscoveryConfig | None = None,
+) -> ManagerState:
+    """전략 확정 후 포렌식 도구 탐지 및 MCP 설치 후보 산출
+
+    계획 수립 직전에 실행. 승인 후보가 있으면 HITL 게이트를 대기 상태로 두어
+    `apply_mcp_installs` 호출을 기다림
+
+    Args:
+        state: 전략이 확정된 Manager 상태
+        mcp_config: 현재 등록된 MCP 설정
+        config_path: mcp_servers.json 경로
+        discovery_config: 탐색 루트/타임아웃 설정
+
+    Returns:
+        discovery_report와 HITL 대기 여부가 반영된 상태
+    """
+    updates = await discovery_node(
+        state,
+        mcp_config=mcp_config,
+        config_path=config_path,
+        discovery_config=discovery_config,
+    )
+    new_state = {**state, **updates}
+    new_state.update(hitl_mcp_install_gate(new_state))
+    return new_state
+
+
+async def apply_mcp_installs(
+    state: ManagerState,
+    server_ids: list[str],
+    config_path: Path,
+    install_root: Path,
+    progress: Any | None = None,
+) -> tuple[ManagerState, list[InstallOutcome]]:
+    """사용자가 승인한 MCP 서버를 설치하고 설정에 등록
+
+    설치가 필요 없는(이미 로컬에 있는) 서버는 등록만 수행.
+    설치 실패는 예외로 올리지 않고 결과 목록으로 반환해, 일부 실패가
+    분석 진행 자체를 막지 않도록 함
+
+    Args:
+        state: MCP 설치 승인 대기 중인 상태
+        server_ids: 사용자가 승인한 서버 키 목록
+        config_path: mcp_servers.json 경로
+        install_root: 팀 서버 저장소를 클론할 상위 디렉터리
+        progress: 진행 상황 알림 콜백
+
+    Returns:
+        (갱신된 상태, 서버별 설치 결과 목록)
+    """
+    report = state.get("discovery_report") or {}
+    recommendations = _rebuild_recommendations(report, set(server_ids))
+
+    installer = MCPInstaller(install_root=install_root, progress=progress)
+    outcomes: list[InstallOutcome] = []
+    proposals: list[ServerProposal] = []
+
+    for recommendation in recommendations:
+        resolved = recommendation.resolved_command
+        if not resolved:
+            outcome = await installer.install(recommendation)
+            outcomes.append(outcome)
+            if not outcome.ok:
+                continue
+            resolved = outcome.resolved_command
+        else:
+            outcomes.append(
+                InstallOutcome(
+                    server_id=recommendation.candidate.server_id,
+                    ok=True,
+                    resolved_command=resolved,
+                )
+            )
+
+        proposals.append(
+            ServerProposal(
+                server_id=recommendation.candidate.server_id,
+                entry={
+                    "command": resolved,
+                    "args": list(recommendation.candidate.args),
+                },
+                ready=True,
+            )
+        )
+
+    added = apply_proposals(config_path, proposals) if proposals else []
+    logger.info(
+        "mcp_installs_applied",
+        approved=server_ids,
+        registered=added,
+        failures=[o.server_id for o in outcomes if not o.ok],
+    )
+
+    new_state: ManagerState = {
+        **state,
+        "installed_mcp_servers": [
+            *(state.get("installed_mcp_servers") or []),
+            *added,
+        ],
+        "pending_mcp_installs": [],
+        "hitl_pending": False,
+        "hitl_type": "",
+    }
+    return new_state, outcomes
+
+
+def _rebuild_recommendations(
+    report: dict[str, Any], server_ids: set[str]
+) -> list[MCPRecommendation]:
+    """직렬화된 리포트에서 승인된 추천 객체 복원
+
+    Args:
+        report: DiscoveryReport 직렬화 결과
+        server_ids: 승인된 서버 키 집합
+
+    Returns:
+        복원된 추천 목록
+    """
+    restored: list[MCPRecommendation] = []
+    for raw in report.get("recommendations", []):
+        try:
+            recommendation = MCPRecommendation.model_validate(raw)
+        except ValidationError:
+            logger.warning("recommendation_restore_failed", raw=raw)
+            continue
+        if recommendation.candidate.server_id in server_ids:
+            restored.append(recommendation)
+    return restored
 
 
 async def run_planning(
@@ -197,6 +341,30 @@ async def run_execution(
 
     prefetch_cache: dict[str, str] = {}
 
+    await mcp.list_tools()
+
+    if disk_image_path:
+        for server in connected_servers:
+            try:
+                open_result = await mcp.call_tool(
+                    f"{server}__open_target", {"path": disk_image_path}
+                )
+                target_text = mcp.get_tool_result_text(open_result)
+                import json as _json
+                try:
+                    target_data = _json.loads(target_text)
+                    target_id = target_data.get("target_id", "")
+                except (ValueError, TypeError):
+                    target_id = ""
+                if target_id:
+                    plugin_result = await mcp.call_tool(
+                        f"{server}__list_plugins", {"target_id": target_id}
+                    )
+                    prefetch_cache[server] = mcp.get_tool_result_text(plugin_result)
+                    logger.info("plugins_prefetched", server=server, target_id=target_id)
+            except Exception as exc:
+                logger.debug("prefetch_open_skipped", server=server, error=str(exc))
+
     context = ""
     i = 0
 
@@ -263,6 +431,7 @@ async def run_execution(
         )
         sub_state = registry.build_state(server_name, task)
 
+        step_start_time = datetime.now(timezone.utc)
         try:
             sub_result = await sub_graph.ainvoke(sub_state)
             if sub_result.get("result"):
@@ -359,6 +528,9 @@ async def run_execution(
                         agent_run_rec.id,
                         status=last_result.get("status", "error"),
                     )
+                    step_elapsed_ms = int(
+                        (datetime.now(timezone.utc) - step_start_time).total_seconds() * 1000
+                    )
                     await create_task_result(
                         session,
                         agent_run_id=agent_run_rec.id,
@@ -367,6 +539,7 @@ async def run_execution(
                         status=last_result.get("status", "error"),
                         output=last_result.get("output", ""),
                         dfxml_fragment=dfxml_frag if last_result.get("status") == "success" else "",
+                        elapsed_ms=step_elapsed_ms,
                     )
             except Exception as exc:
                 logger.warning(
@@ -405,6 +578,30 @@ async def run_execution(
             )
 
         i += 1
+
+    if db_engine and db_session_id:
+        results_text = "\n".join(
+            f"[{r.get('agent_name', '')}] {r.get('output', '')[:300]}"
+            for r in results
+            if r.get("status") == "success"
+        )
+        try:
+            async with get_session(db_engine) as session:
+                await update_analysis_session(
+                    session,
+                    session_id=db_session_id,
+                    phase="report",
+                    result_summary=results_text[:5000],
+                )
+        except Exception as exc:
+            logger.warning("analysis_session_update_failed", error=str(exc))
+
+    if db_engine and state.get("case_id"):
+        try:
+            async with get_session(db_engine) as session:
+                await save_workflow_graph(session, state["case_id"], graph)
+        except Exception as exc:
+            logger.warning("workflow_graph_save_failed", error=str(exc))
 
     if rag_service and state.get("case_id"):
         results_summary = "\n".join(
@@ -512,4 +709,7 @@ def create_manager_state(
         evidence_repository=[],
         rag_context="",
         node_graph=create_initial_graph(),
+        discovery_report=None,
+        pending_mcp_installs=[],
+        installed_mcp_servers=[],
     )

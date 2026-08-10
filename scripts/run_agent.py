@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -31,7 +32,9 @@ from docx import Document
 from docx.shared import Pt
 
 from agents.manager.graph import (
+    apply_mcp_installs,
     create_manager_state,
+    run_discovery,
     run_execution,
     run_planning,
     run_report,
@@ -39,12 +42,12 @@ from agents.manager.graph import (
 )
 from config import LLMProvider, load_settings
 from database.engine import get_engine, init_db
-from database.repository import create_case
 from disk_image_validator import validate_image_path
 from event_callback import PersistentExecutionCallback
 from event_store import AnalysisEventStore
 from llm_provider.anthropic import AnthropicProvider
 from llm_provider.base import BaseLLMProvider
+from llm_provider.claude_code import ClaudeCodeProvider
 from llm_provider.openai import OpenAIProvider
 from mcp_client.client import MCPClientManager
 from rag.embedding import Embedder
@@ -230,9 +233,17 @@ def create_llm_provider(settings, api_choice: str = "default") -> BaseLLMProvide
 
     Args:
         settings: 애플리케이션 설정
-        api_choice: "default", "anthropic", "anthropic_haiku", "mindlogic" 중 하나
+        api_choice: "default", "anthropic", "anthropic_haiku", "mindlogic",
+            "claude_code" 중 하나
     """
     from config import LLMConfig
+
+    if api_choice == "claude_code":
+        config = LLMConfig(
+            provider=LLMProvider.CLAUDE_CODE,
+            model=settings.claude_code_model,
+        )
+        return ClaudeCodeProvider(config, settings.claude_code)
 
     if api_choice == "anthropic":
         config = LLMConfig(model=settings.anthropic_model)
@@ -433,6 +444,103 @@ async def run_strategy_hitl(state, llm, rag_service=None) -> dict:
         print(f"  {DIM}전략 재수립 중...{RESET}")
 
 
+async def run_discovery_hitl(state, settings, config_path) -> dict:
+    """포렌식 도구 탐지 후 MCP 설치 승인 처리
+
+    탐지된 도구 중 전략과 관련되고 아직 등록되지 않은 MCP 서버를 나열하고,
+    사용자 승인을 받아 설치·등록까지 수행
+
+    Args:
+        state: 전략이 확정된 Manager 상태
+        settings: 애플리케이션 설정
+        config_path: mcp_servers.json 경로
+
+    Returns:
+        설치 결과가 반영된 상태
+    """
+    print_header("포렌식 도구 탐지 및 MCP 확인")
+    current = await run_discovery(
+        state,
+        mcp_config=settings.mcp,
+        config_path=config_path,
+        discovery_config=settings.discovery,
+    )
+
+    report = current.get("discovery_report") or {}
+    detected = report.get("detected_tools", [])
+    print(f"  탐지된 포렌식 도구: {len(detected)}개")
+    for tool in detected:
+        version = f" v{tool['version']}" if tool.get("version") else ""
+        print(f"    - {tool['display_name']}{version}")
+
+    pending = current.get("pending_mcp_installs") or []
+    if not pending:
+        print(f"  {GREEN}추가로 설치할 MCP 서버가 없습니다.{RESET}")
+        return current
+
+    print(f"\n  {BOLD}설치 가능한 MCP 서버{RESET}:")
+    for index, item in enumerate(pending, start=1):
+        print(f"    {index}. {item['message']}")
+        print(f"       {DIM}{item['display_name']} — {item['description']}{RESET}")
+        if item.get("install_hint"):
+            print(f"       {DIM}설치: {item['install_hint']}{RESET}")
+
+    answer = input(
+        "\n  설치할 항목 번호를 쉼표로 입력 (a=전체, 엔터=건너뛰기) > "
+    ).strip().lower()
+
+    if not answer:
+        print(f"  {DIM}설치를 건너뜁니다.{RESET}")
+        return {
+            **current,
+            "pending_mcp_installs": [],
+            "hitl_pending": False,
+            "hitl_type": "",
+        }
+
+    if answer == "a":
+        targets = [item["server_id"] for item in pending]
+    else:
+        targets = []
+        for token in answer.split(","):
+            token = token.strip()
+            if token.isdigit() and 1 <= int(token) <= len(pending):
+                targets.append(pending[int(token) - 1]["server_id"])
+
+    if not targets:
+        print(f"  {RED}유효한 번호가 없어 설치를 건너뜁니다.{RESET}")
+        return {
+            **current,
+            "pending_mcp_installs": [],
+            "hitl_pending": False,
+            "hitl_type": "",
+        }
+
+    async def progress(message: str) -> None:
+        """설치 진행 상황 콘솔 출력"""
+        print(f"    {DIM}{message}{RESET}")
+
+    install_root = (
+        Path(settings.discovery.search_roots[0]).expanduser()
+        if settings.discovery.search_roots
+        else Path(__file__).resolve().parents[2]
+    )
+    current, outcomes = await apply_mcp_installs(
+        current,
+        targets,
+        config_path=config_path,
+        install_root=install_root,
+        progress=progress,
+    )
+
+    for outcome in outcomes:
+        mark = f"{GREEN}완료{RESET}" if outcome.ok else f"{RED}실패{RESET}"
+        detail = outcome.resolved_command or outcome.error or ""
+        print(f"    {outcome.server_id}: {mark} {DIM}{detail}{RESET}")
+
+    return current
+
+
 async def run_planning_hitl(state, llm, mcp) -> dict:
     """계획 수립 HITL 루프
 
@@ -541,6 +649,16 @@ def parse_args() -> argparse.Namespace:
         "--use-cache", action="store_true",
         help="동일 입력의 전략/계획 캐시 사용 (테스트용, 추후 삭제 예정)",
     )
+    parser.add_argument(
+        "--llm-mode",
+        choices=["openai", "anthropic", "anthropic_haiku", "mindlogic", "claude_code"],
+        help="LLM 실행 모드를 지정해 대화형 선택 생략 (claude_code=헤드리스 CLI)",
+    )
+    parser.add_argument(
+        "--skip-discovery",
+        action="store_true",
+        help="포렌식 도구 탐지 및 MCP 설치 제안 단계 생략",
+    )
     return parser.parse_args()
 
 
@@ -566,6 +684,7 @@ async def main() -> None:
     has_default = bool(settings.openai_api_key)
     has_anthropic = bool(settings.anthropic_api_key)
     has_mindlogic = bool(settings.mindlogic_api_key)
+    has_claude_code = shutil.which(settings.claude_code.cli_path) is not None
 
     print(f"\n  {BOLD}API 선택{RESET}:")
     if has_default:
@@ -586,8 +705,19 @@ async def main() -> None:
     else:
         print(f"    {DIM}4. MindLogic Gateway (MINDLOGIC_API_KEY 미설정){RESET}")
 
+    if has_claude_code:
+        print(f"    5. Claude Code 헤드리스 ({settings.claude_code_model})")
+        print(f"       {DIM}└ API 키 없이 로컬 Claude Code 구독 인증 사용{RESET}")
+    else:
+        print(f"    {DIM}5. Claude Code 헤드리스 (claude CLI 미설치){RESET}")
+
     api_choice = "default"
-    choice = input("  선택 (1/2/3/4, 기본=1) > ").strip()
+    if args.llm_mode:
+        api_choice = "default" if args.llm_mode == "openai" else args.llm_mode
+        print(f"  {GREEN}--llm-mode 지정{RESET}: {args.llm_mode}")
+        choice = ""
+    else:
+        choice = input("  선택 (1/2/3/4/5, 기본=1) > ").strip()
     if choice == "2" and has_anthropic:
         api_choice = "anthropic"
         print(f"  {GREEN}Anthropic API 사용{RESET}: {settings.anthropic_model}")
@@ -597,7 +727,13 @@ async def main() -> None:
     elif choice == "4" and has_mindlogic:
         api_choice = "mindlogic"
         print(f"  {GREEN}MindLogic Gateway 사용{RESET}: {settings.mindlogic_model}")
-    else:
+    elif choice == "5" and has_claude_code:
+        api_choice = "claude_code"
+        print(
+            f"  {GREEN}Claude Code 헤드리스 사용{RESET}: "
+            f"{settings.claude_code_model}"
+        )
+    elif not args.llm_mode:
         print(f"  {GREEN}OpenAI API 사용{RESET}: {settings.openai_model}")
 
     print(f"  {BOLD}MCP{RESET}:  {', '.join(settings.mcp.servers.keys()) or '(없음)'}")
@@ -610,6 +746,9 @@ async def main() -> None:
         return
     if api_choice == "mindlogic" and not has_mindlogic:
         print(f"  {RED}MINDLOGIC_API_KEY가 설정되지 않았습니다.{RESET}")
+        return
+    if api_choice == "claude_code" and not has_claude_code:
+        print(f"  {RED}claude CLI를 찾을 수 없습니다 (Claude Code 설치 필요).{RESET}")
         return
     if not settings.database_url:
         print(f"  {RED}DATABASE_URL이 설정되지 않았습니다.{RESET}")
@@ -638,6 +777,19 @@ async def main() -> None:
     light_llm: BaseLLMProvider | None = None
     if api_choice == "anthropic_haiku":
         pass
+    elif api_choice == "claude_code":
+        from config import LLMConfig
+        light_llm = ClaudeCodeProvider(
+            LLMConfig(
+                provider=LLMProvider.CLAUDE_CODE,
+                model=settings.claude_code_light_model,
+            ),
+            settings.claude_code,
+        )
+        print(
+            f"  {BOLD}경량 LLM{RESET}: {settings.claude_code_light_model} "
+            "(헤드리스, 요약/변환용)"
+        )
     elif has_anthropic:
         light_llm = AnthropicProvider(settings.light_llm, api_key=settings.anthropic_api_key)
         print(f"  {BOLD}경량 LLM{RESET}: {settings.light_llm.model} (요약/변환용)")
@@ -726,6 +878,20 @@ async def main() -> None:
                     "strategy_ready",
                     {"strategy": state.get("analysis_strategy", "")[:500]},
                 )
+
+                if not args.skip_discovery:
+                    state = await run_discovery_hitl(
+                        state, settings, config_path
+                    )
+                    if state.get("installed_mcp_servers"):
+                        print(
+                            f"  {GREEN}MCP 재연결 중{RESET}: "
+                            f"{', '.join(state['installed_mcp_servers'])}"
+                        )
+                        settings = load_settings(config_path)
+                        await mcp.reconnect(settings.mcp)
+                        tools = await mcp.list_tools(refresh=True)
+                        print_tools(tools, verbose=args.verbose)
 
                 accumulated_results = []
 

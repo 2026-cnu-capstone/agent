@@ -5,13 +5,20 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from pathlib import Path
 from typing import Any
 
 import structlog
 
-from prompts.manager import build_planning_prompt, build_strategy_prompt
+from config import DiscoveryConfig, MCPConfig
+from discovery.catalog import TOOL_INDEX
+from discovery.proposal import build_proposals
+from discovery.recommender import filter_by_strategy
+from discovery.service import DiscoveryService
+from discovery.types import InstallState, MCPRecommendation
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
+from prompts.manager import build_planning_prompt, build_strategy_prompt
 from rag.service import RAGService
 from state.manager import ManagerState
 from state.messages import TaskAssignment
@@ -127,6 +134,105 @@ async def planning_node(
     }
 
 
+async def discovery_node(
+    state: ManagerState,
+    *,
+    mcp_config: MCPConfig | None = None,
+    config_path: Path | None = None,
+    discovery_config: DiscoveryConfig | None = None,
+) -> dict[str, Any]:
+    """전략 확정 후 로컬 포렌식 도구 및 MCP 설치 후보 탐지
+
+    계획 수립 전에 실행해야 의미가 있음. `planning_node`가 연결된 MCP 서버
+    목록을 프롬프트에 주입하므로, 이 단계에서 서버가 추가되면 계획의 범위가
+    실제로 넓어짐
+
+    탐지된 추천 중 전략과 무관한 항목은 제외하고, 아직 등록되지 않았지만
+    설치 가능한 항목만 승인 후보로 올림
+
+    Args:
+        state: 전략이 확정된 Manager 상태
+        mcp_config: 현재 등록된 MCP 설정
+        config_path: mcp_servers.json 경로
+        discovery_config: 탐색 루트/타임아웃 설정
+
+    Returns:
+        discovery_report와 pending_mcp_installs가 채워진 상태 업데이트
+    """
+    service = DiscoveryService(
+        mcp_config=mcp_config,
+        config_path=config_path,
+        discovery_config=discovery_config,
+    )
+    report = await service.discover(verify=True)
+
+    strategy_text = state.get("analysis_strategy", "")
+    relevant = filter_by_strategy(report.recommendations, strategy_text)
+    report.recommendations = relevant
+    report.proposals = build_proposals(relevant)
+
+    pending = [
+        {
+            "server_id": rec.candidate.server_id,
+            "display_name": rec.candidate.display_name,
+            "description": rec.candidate.description,
+            "source": rec.candidate.source.value,
+            "matched_tools": [
+                TOOL_INDEX[tool_id].display_name
+                for tool_id in rec.matched_tools
+                if tool_id in TOOL_INDEX
+            ],
+            "install_state": rec.install_state.value,
+            "install_hint": rec.candidate.install_hint,
+            "reason": rec.reason,
+            "message": _build_install_prompt(rec),
+        }
+        for rec in relevant
+        if rec.install_state is not InstallState.CONFIGURED
+    ]
+
+    logger.info(
+        "discovery_node_completed",
+        detected=len(report.detected_tools),
+        relevant=len(relevant),
+        pending=len(pending),
+    )
+
+    return {
+        "discovery_report": report.model_dump(mode="json"),
+        "pending_mcp_installs": pending,
+        "phase": "mcp_discovery",
+    }
+
+
+def _build_install_prompt(recommendation: MCPRecommendation) -> str:
+    """사용자에게 보여줄 설치 확인 문구 생성
+
+    Args:
+        recommendation: 설치 후보 추천
+
+    Returns:
+        확인 알림에 사용할 한국어 문구
+    """
+    tool_names = [
+        TOOL_INDEX[tool_id].display_name
+        for tool_id in recommendation.matched_tools
+        if tool_id in TOOL_INDEX
+    ]
+    subject = (
+        ", ".join(tool_names)
+        if tool_names
+        else recommendation.candidate.display_name
+    )
+
+    if recommendation.install_state is InstallState.INSTALLED:
+        return (
+            f"{subject}의 MCP 서버가 이미 설치되어 있으나 등록되지 않았습니다. "
+            "등록하겠습니까?"
+        )
+    return f"{subject}의 MCP를 설치 가능합니다. 설치하겠습니까?"
+
+
 def routing_node(state: ManagerState) -> dict[str, Any]:
     """plan_steps를 기반으로 TaskAssignment 생성 및 큐에 적재
 
@@ -205,6 +311,26 @@ def hitl_plan_gate(state: ManagerState) -> dict[str, Any]:
     return {
         "hitl_pending": True,
         "hitl_type": "plan",
+    }
+
+
+def hitl_mcp_install_gate(state: ManagerState) -> dict[str, Any]:
+    """MCP 설치 제안 후 HITL 승인 대기 상태 설정
+
+    설치 후보가 없으면 대기하지 않고 계획 단계로 통과시킴
+
+    Args:
+        state: 탐지 리포트가 채워진 Manager 상태
+
+    Returns:
+        승인 대기 여부가 반영된 상태 업데이트
+    """
+    pending = state.get("pending_mcp_installs") or []
+    if not pending:
+        return {"hitl_pending": False, "hitl_type": ""}
+    return {
+        "hitl_pending": True,
+        "hitl_type": "mcp_install",
     }
 
 

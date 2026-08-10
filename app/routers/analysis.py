@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from app.agent_bridge import (
+    approve_mcp_install,
     approve_plan,
     approve_strategy,
     execute_analysis,
@@ -15,7 +16,12 @@ from app.agent_bridge import (
     request_cancel,
     start_analysis,
 )
-from app.models import AnalysisRequest, PlanApproval, StrategyApproval
+from app.models import (
+    AnalysisRequest,
+    McpInstallApproval,
+    PlanApproval,
+    StrategyApproval,
+)
 from app.ws_manager import manager as ws_manager
 
 router = APIRouter(prefix="/api/analysis", tags=["analysis"])
@@ -48,13 +54,37 @@ async def api_start_analysis(req: AnalysisRequest):
 
 @router.post("/{case_id}/strategy/approve")
 async def api_approve_strategy(case_id: str, req: StrategyApproval):
-    """전략 승인/수정"""
+    """전략 승인/수정
+
+    승인 시 계획 수립 전에 포렌식 도구 탐지를 수행하며, 설치 가능한 MCP
+    서버가 있으면 `mcp_install_pending`으로 응답해 사용자 승인을 요청
+    """
     try:
         result = await approve_strategy(case_id, req.approved, req.feedback)
+        if result.get("mcp_install_pending"):
+            return result
         if result.get("plan_ready"):
             await ws_manager.send_event(case_id, "plan_ready", result)
         else:
             await ws_manager.send_event(case_id, "strategy_ready", result)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{case_id}/mcp-install/approve")
+async def api_approve_mcp_install(case_id: str, req: McpInstallApproval):
+    """MCP 서버 설치 승인/거부
+
+    승인하면 설치 → mcp_servers.json 등록 → MCP 재연결을 거친 뒤
+    계획을 수립하므로, 새로 추가된 서버가 계획에 반영됨
+    """
+    try:
+        result = await approve_mcp_install(case_id, req.approved, req.server_ids)
+        if result.get("plan_ready"):
+            await ws_manager.send_event(case_id, "plan_ready", result)
         return result
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

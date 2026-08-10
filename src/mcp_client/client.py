@@ -120,6 +120,25 @@ class MCPClientManager:
         self._tool_cache.invalidate()
         logger.info("all_mcp_servers_disconnected")
 
+    async def reconnect(self, config: MCPConfig | None = None) -> None:
+        """설정을 교체하고 모든 서버 재연결
+
+        분석 중 새 MCP 서버가 등록됐을 때 실행 세션에 반영하기 위한 경로.
+        닫힌 AsyncExitStack을 재사용하지 않고 새로 만들며, anyio cancel scope
+        제약상 `connect_all`을 호출한 task와 동일한 task에서 호출해야 함
+
+        Args:
+            config: 교체할 MCP 설정 (None이면 기존 설정 유지)
+        """
+        await self.disconnect_all()
+        if config is not None:
+            self._config = config
+        self._exit_stack = AsyncExitStack()
+        await self.connect_all()
+        logger.info(
+            "mcp_servers_reconnected", servers=list(self._sessions.keys())
+        )
+
     async def list_tools(
         self, *, refresh: bool = False
     ) -> dict[str, Tool]:

@@ -6,6 +6,7 @@ FastAPI 백엔드에서 agent src/ 모듈을 직접 import하여 호출
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import time
 from collections import OrderedDict
@@ -24,7 +25,9 @@ if AGENT_ENV.exists() and not os.environ.get("LLM_API_KEY"):
 
 from agents.manager.graph import (
     ExecutionCallback,
+    apply_mcp_installs,
     create_manager_state,
+    run_discovery,
     run_execution,
     run_planning,
     run_report,
@@ -34,6 +37,7 @@ from config import LLMProvider, load_settings
 from database.engine import get_engine, init_db
 from database.repository import create_case, update_case_analysis_info, update_case_status
 from llm_provider.base import BaseLLMProvider
+from llm_provider.claude_code import ClaudeCodeProvider
 from llm_provider.openai import OpenAIProvider
 from llm_provider.anthropic import AnthropicProvider
 from mcp_client.client import MCPClientManager
@@ -55,15 +59,127 @@ _rag_service: RAGService | None = None
 _analysis_states: OrderedDict[str, ManagerState] = OrderedDict()
 _cancel_flags: dict[str, bool] = {}
 _db_engine = None
+_api_choice: str = "default"
+
+
+def get_api_choice() -> str:
+    """현재 LLM API 선택값 반환"""
+    return _api_choice
+
+
+def set_api_choice(choice: str) -> None:
+    """LLM API 선택값 변경 및 캐시 초기화
+
+    헤드리스 모드 전환 시 경량 LLM 프로바이더도 함께 바뀌므로
+    "light" 캐시까지 비움
+    """
+    global _api_choice
+    _api_choice = choice
+    _llm_cache.pop("default", None)
+    _llm_cache.pop("light", None)
+    _llm_cache.pop(choice, None)
+
+
+async def get_llm_options() -> dict[str, Any]:
+    """사용 가능한 LLM 옵션 목록 반환"""
+    settings = await get_settings()
+    options = []
+    if settings.openai_api_key:
+        options.append({
+            "id": "openai",
+            "label": "OpenAI",
+            "model": settings.openai_model,
+            "available": True,
+        })
+    if settings.anthropic_api_key:
+        options.append({
+            "id": "anthropic",
+            "label": "Anthropic",
+            "model": settings.anthropic_model,
+            "available": True,
+        })
+    if settings.mindlogic_api_key:
+        options.append({
+            "id": "mindlogic",
+            "label": "Mindlogic",
+            "model": settings.mindlogic_model,
+            "available": True,
+        })
+    options.append({
+        "id": "claude_code",
+        "label": "Claude Code (헤드리스)",
+        "model": settings.claude_code_model,
+        "available": shutil.which(settings.claude_code.cli_path) is not None,
+        "note": "API 키 대신 로컬 Claude Code 구독 인증 사용",
+    })
+
+    current = _api_choice
+    if current == "default":
+        if settings.llm.provider == LLMProvider.CLAUDE_CODE:
+            current = "claude_code"
+        elif settings.llm.provider == LLMProvider.OPENAI and settings.llm.base_url:
+            current = "mindlogic" if settings.mindlogic_api_key else "openai"
+        elif settings.llm.provider == LLMProvider.OPENAI:
+            current = "openai"
+        else:
+            current = "anthropic"
+
+    light_available = bool(settings.anthropic_api_key)
+    return {
+        "current": current,
+        "options": options,
+        "light_llm": {
+            "model": settings.light_llm.model,
+            "available": light_available,
+        },
+    }
+
+
+def get_mcp_config_path() -> Path:
+    """MCP 서버 설정 파일 경로 반환"""
+    return AGENT_SRC.parent / "config" / "mcp_servers.json"
 
 
 async def get_settings():
     """설정 로드 (캐시)"""
     global _settings
     if _settings is None:
-        config_path = AGENT_SRC.parent / "config" / "mcp_servers.json"
-        _settings = load_settings(config_path)
+        _settings = load_settings(get_mcp_config_path())
     return _settings
+
+
+async def reload_settings():
+    """설정 캐시를 버리고 mcp_servers.json을 다시 로드
+
+    MCP 서버를 새로 등록한 직후 호출해야 함. `reset_mcp()`만 호출하면
+    캐시된 옛 설정으로 재연결되어 새 서버가 반영되지 않음
+
+    Returns:
+        새로 로드된 Settings 인스턴스
+    """
+    global _settings
+    _settings = load_settings(get_mcp_config_path())
+    _llm_cache.clear()
+    return _settings
+
+
+async def reconnect_mcp() -> MCPClientManager:
+    """설정을 다시 읽어 MCP 서버 전체 재연결
+
+    새로 등록된 서버를 실행 중 세션에 반영하기 위한 경로.
+    `MCPClientManager`는 증분 연결 API가 없고 anyio cancel scope가 생성
+    task에 묶여 있어, 전체 재연결이 가장 안전한 방식
+
+    Returns:
+        재연결된 MCP 클라이언트 매니저
+    """
+    await reset_mcp()
+    await reload_settings()
+    mcp = await get_mcp()
+    logger_names = mcp.connected_servers
+    import logging
+    logging.getLogger("agent_bridge").info("mcp_reconnected: %s", logger_names)
+    return mcp
 
 
 async def get_db_engine():
@@ -114,7 +230,19 @@ async def get_llm(api_choice: str = "default") -> BaseLLMProvider:
 
     settings = await get_settings()
 
-    if api_choice == "mindlogic" and settings.mindlogic_api_key:
+    if api_choice == "claude_code" or (
+        api_choice == "default"
+        and settings.llm.provider == LLMProvider.CLAUDE_CODE
+    ):
+        from config import LLMConfig
+        cc_config = LLMConfig(
+            provider=LLMProvider.CLAUDE_CODE,
+            model=settings.claude_code_model,
+            max_tokens=settings.llm.max_tokens,
+            temperature=settings.llm.temperature,
+        )
+        llm = ClaudeCodeProvider(cc_config, settings.claude_code)
+    elif api_choice == "mindlogic" and settings.mindlogic_api_key:
         from config import LLMConfig
         mindlogic_config = LLMConfig(
             provider=LLMProvider.OPENAI,
@@ -123,11 +251,44 @@ async def get_llm(api_choice: str = "default") -> BaseLLMProvider:
         )
         llm = OpenAIProvider(mindlogic_config, api_key=settings.mindlogic_api_key)
     elif settings.llm.provider == LLMProvider.OPENAI:
-        llm = OpenAIProvider(settings.llm, api_key=settings.llm_api_key)
+        llm = OpenAIProvider(settings.llm, api_key=settings.openai_api_key)
     else:
-        llm = AnthropicProvider(settings.llm, api_key=settings.llm_api_key)
+        llm = AnthropicProvider(settings.llm, api_key=settings.anthropic_api_key)
 
     _llm_cache[api_choice] = llm
+    return llm
+
+
+async def get_light_llm() -> BaseLLMProvider | None:
+    """경량 LLM 프로바이더 반환 (요약, DFXML 변환 등 단순 작업용)
+
+    Claude Code 헤드리스 모드가 선택된 경우 API 키 없이도 경량 프로바이더를
+    제공하므로 요약/DFXML 변환 경로가 비활성화되지 않음
+    """
+    if "light" in _llm_cache:
+        return _llm_cache["light"]
+
+    settings = await get_settings()
+
+    if _api_choice == "claude_code" or (
+        _api_choice == "default"
+        and settings.llm.provider == LLMProvider.CLAUDE_CODE
+    ):
+        from config import LLMConfig
+        light_config = LLMConfig(
+            provider=LLMProvider.CLAUDE_CODE,
+            model=settings.claude_code_light_model,
+            max_tokens=settings.light_llm.max_tokens,
+        )
+        llm: BaseLLMProvider = ClaudeCodeProvider(light_config, settings.claude_code)
+        _llm_cache["light"] = llm
+        return llm
+
+    if not settings.anthropic_api_key:
+        return None
+
+    llm = AnthropicProvider(settings.light_llm, api_key=settings.anthropic_api_key)
+    _llm_cache["light"] = llm
     return llm
 
 
@@ -290,7 +451,7 @@ async def start_analysis(case_id: str, disk_image_path: str, prompt: str) -> dic
     """분석 시작: 시스템 프로필 추출 + 전략 생성"""
     _enforce_session_limit()
     mcp = await get_mcp()
-    llm = await get_llm()
+    llm = await get_llm(_api_choice)
     rag = await get_rag_service()
 
     system_profile = ""
@@ -351,7 +512,7 @@ async def approve_strategy(case_id: str, approved: bool, feedback: str = "") -> 
     if not state:
         raise ValueError(f"분석 세션 없음: {case_id}")
 
-    llm = await get_llm()
+    llm = await get_llm(_api_choice)
     mcp = await get_mcp()
     rag = await get_rag_service()
 
@@ -376,6 +537,49 @@ async def approve_strategy(case_id: str, approved: bool, feedback: str = "") -> 
             "node_graph": get_graph_response(node_graph) if node_graph else None,
         }
 
+    settings = await get_settings()
+    state = await run_discovery(
+        state,
+        mcp_config=settings.mcp,
+        config_path=get_mcp_config_path(),
+        discovery_config=settings.discovery,
+    )
+    _analysis_states[case_id] = state
+
+    if state.get("hitl_type") == "mcp_install" and state.get("hitl_pending"):
+        pending = state.get("pending_mcp_installs") or []
+        await ws_manager.send_event(
+            case_id,
+            "mcp_install_proposed",
+            {"pending": pending},
+        )
+        return {
+            "plan_ready": False,
+            "mcp_install_pending": True,
+            "pending_mcp_installs": pending,
+            "discovery_report": state.get("discovery_report"),
+        }
+
+    return await _run_planning_and_respond(case_id, state, llm, mcp)
+
+
+async def _run_planning_and_respond(
+    case_id: str,
+    state: ManagerState,
+    llm: BaseLLMProvider,
+    mcp: MCPClientManager,
+) -> dict[str, Any]:
+    """계획 수립 실행 후 API 응답 구성
+
+    Args:
+        case_id: 분석 케이스 ID
+        state: 계획 수립 직전 상태
+        llm: LLM 프로바이더
+        mcp: MCP 클라이언트 매니저
+
+    Returns:
+        계획 텍스트와 단계 목록이 담긴 응답
+    """
     state = await run_planning(state, llm, mcp)
     _analysis_states[case_id] = state
 
@@ -392,7 +596,95 @@ async def approve_strategy(case_id: str, approved: bool, feedback: str = "") -> 
         "steps": steps,
         "plan_ready": True,
         "node_graph": get_graph_response(node_graph) if node_graph else None,
+        "installed_mcp_servers": state.get("installed_mcp_servers") or [],
     }
+
+
+async def approve_mcp_install(
+    case_id: str,
+    approved: bool,
+    server_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """MCP 설치 제안 승인/거부 처리 후 계획 수립 진행
+
+    승인 시 설치 → mcp_servers.json 등록 → MCP 재연결까지 수행하므로,
+    이어지는 계획 수립이 새로 추가된 서버를 반영
+
+    Args:
+        case_id: 분석 케이스 ID
+        approved: 설치 승인 여부
+        server_ids: 승인한 서버 키 목록 (None이면 제안 전체)
+
+    Returns:
+        설치 결과와 계획 수립 결과가 담긴 응답
+
+    Raises:
+        ValueError: 분석 세션이 없을 때
+    """
+    state = _analysis_states.get(case_id)
+    if not state:
+        raise ValueError(f"분석 세션 없음: {case_id}")
+
+    llm = await get_llm(_api_choice)
+    settings = await get_settings()
+    install_results: list[dict[str, Any]] = []
+
+    if not approved:
+        state = {
+            **state,
+            "pending_mcp_installs": [],
+            "hitl_pending": False,
+            "hitl_type": "",
+        }
+        _analysis_states[case_id] = state
+        mcp = await get_mcp()
+        response = await _run_planning_and_respond(case_id, state, llm, mcp)
+        response["install_results"] = install_results
+        return response
+
+    pending = state.get("pending_mcp_installs") or []
+    targets = server_ids or [item["server_id"] for item in pending]
+
+    async def progress(message: str) -> None:
+        """설치 진행 상황을 WebSocket으로 전달"""
+        await ws_manager.send_event(
+            case_id, "mcp_install_progress", {"message": message}
+        )
+
+    install_root = (
+        Path(settings.discovery.search_roots[0]).expanduser()
+        if settings.discovery.search_roots
+        else AGENT_ROOT.parent
+    )
+
+    state, outcomes = await apply_mcp_installs(
+        state,
+        targets,
+        config_path=get_mcp_config_path(),
+        install_root=install_root,
+        progress=progress,
+    )
+    _analysis_states[case_id] = state
+    install_results = [outcome.model_dump(exclude={"log"}) for outcome in outcomes]
+
+    if state.get("installed_mcp_servers"):
+        mcp = await reconnect_mcp()
+    else:
+        mcp = await get_mcp()
+
+    await ws_manager.send_event(
+        case_id,
+        "mcp_install_completed",
+        {
+            "results": install_results,
+            "connected_servers": mcp.connected_servers,
+        },
+    )
+
+    response = await _run_planning_and_respond(case_id, state, llm, mcp)
+    response["install_results"] = install_results
+    response["connected_servers"] = mcp.connected_servers
+    return response
 
 
 async def approve_plan(case_id: str, approved: bool, feedback: str = "") -> dict[str, Any]:
@@ -401,7 +693,7 @@ async def approve_plan(case_id: str, approved: bool, feedback: str = "") -> dict
     if not state:
         raise ValueError(f"분석 세션 없음: {case_id}")
 
-    llm = await get_llm()
+    llm = await get_llm(_api_choice)
     mcp = await get_mcp()
     rag = await get_rag_service()
 
@@ -438,16 +730,18 @@ async def execute_analysis(case_id: str) -> dict[str, Any]:
         raise ValueError(f"분석 세션 없음: {case_id}")
 
     clear_cancel(case_id)
-    llm = await get_llm()
+    llm = await get_llm(_api_choice)
     mcp = await get_mcp()
     rag = await get_rag_service()
     db_engine = await get_db_engine()
     callback = WebSocketExecutionCallback(case_id)
 
+    light_llm = await get_light_llm()
     state = await run_execution(
         state, llm, mcp,
         callback=callback,
         rag_service=rag,
+        light_llm=light_llm,
         db_engine=db_engine,
         cancel_check=lambda: is_cancelled(case_id),
     )
@@ -468,8 +762,9 @@ async def generate_report(case_id: str) -> dict[str, str]:
     if not state:
         raise ValueError(f"분석 세션 없음: {case_id}")
 
-    llm = await get_llm()
-    result = await run_report(state, llm)
+    llm = await get_llm(_api_choice)
+    light_llm = await get_light_llm()
+    result = await run_report(state, llm, light_llm=light_llm)
     node_graph = result.get("node_graph")
     report_result = {
         "summary": result.get("summary", ""),

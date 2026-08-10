@@ -47,6 +47,18 @@ class PlanApproval(BaseModel):
     feedback: str = ""
 
 
+class McpInstallApproval(BaseModel):
+    """MCP 서버 설치 승인 요청
+
+    Attributes:
+        approved: 설치 승인 여부
+        server_ids: 승인할 서버 키 목록 (None이면 제안된 전체)
+    """
+
+    approved: bool
+    server_ids: list[str] | None = None
+
+
 class StepUpdate(BaseModel):
     """Sub-Agent 단계 진행 이벤트"""
 

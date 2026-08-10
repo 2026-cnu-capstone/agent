@@ -63,7 +63,16 @@ class ManagerState(TypedDict):
     """HITL 승인 대기 여부"""
 
     hitl_type: str
-    """대기 중인 HITL 유형 (strategy | plan | result | 빈 문자열)"""
+    """대기 중인 HITL 유형 (strategy | mcp_install | plan | result | 빈 문자열)"""
+
+    discovery_report: dict[str, Any] | None
+    """포렌식 도구 탐지 및 MCP 추천 리포트 (DiscoveryReport 직렬화 결과)"""
+
+    pending_mcp_installs: list[dict[str, Any]]
+    """사용자 승인 대기 중인 MCP 설치 후보 목록"""
+
+    installed_mcp_servers: list[str]
+    """이번 세션에서 설치·등록된 MCP 서버 키 목록"""
 
     evidence_repository: Annotated[list[dict[str, Any]], operator.add]
     """Sub-Agent별 증거 산출물 누적 저장소 (artifact + format 구조)"""
