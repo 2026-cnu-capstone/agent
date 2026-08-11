@@ -17,6 +17,11 @@ class AnthropicProvider(BaseLLMProvider):
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
         self._config = config
 
+    @property
+    def is_anthropic(self) -> bool:
+        """Anthropic 프로바이더 여부 판별"""
+        return True
+
     async def chat(
         self,
         messages: list[dict[str, Any]],

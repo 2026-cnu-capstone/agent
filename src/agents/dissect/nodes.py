@@ -70,8 +70,6 @@ async def dissect_tool_node(
         mcp: Dissect MCP 클라이언트
         summary_llm: 요약 전용 경량 LLM (None이면 llm 사용)
     """
-    from llm_provider.anthropic import AnthropicProvider
-
     results: list[ToolResult] = []
     summarized_chunks: list[str] = []
 
@@ -107,7 +105,7 @@ async def dissect_tool_node(
             )
         )
 
-    if isinstance(llm, AnthropicProvider):
+    if llm.is_anthropic:
         tool_messages: list[dict[str, Any]] = [
             {
                 "role": "user",

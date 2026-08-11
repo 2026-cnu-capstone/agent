@@ -38,6 +38,11 @@ class LLMResponse:
 class BaseLLMProvider(ABC):
     """LLM 프로바이더 추상 클래스"""
 
+    @property
+    def is_anthropic(self) -> bool:
+        """Anthropic 프로바이더 여부 판별"""
+        return False
+
     @abstractmethod
     async def chat(
         self,
