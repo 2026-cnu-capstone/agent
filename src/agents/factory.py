@@ -8,7 +8,7 @@ MCP 서버명 또는 agent_mapping 설정을 기반으로
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Awaitable
+from typing import Any, Callable
 
 import structlog
 
@@ -128,6 +128,7 @@ class AgentRegistry:
         mcp: MCPClientManager,
         purpose: str = "",
         extra_context: str = "",
+        findings_memo: str = "",
     ) -> Any:
         """서버명 기반 subgraph 동적 생성
 
@@ -140,10 +141,13 @@ class AgentRegistry:
             mcp: MCP 클라이언트 매니저
             purpose: 현재 작업 목적
             extra_context: 사전 조회 데이터 등 추가 컨텍스트
+            findings_memo: 이전 단계들이 확보한 핵심 값 요약
         """
         config = self._configs.get(server_name)
         if config:
-            return config.build_graph(llm, mcp, purpose, extra_context)
+            return config.build_graph(
+                llm, mcp, purpose, extra_context, findings_memo
+            )
 
         from prompts.dissect import format_tool_docs
 
@@ -155,10 +159,16 @@ class AgentRegistry:
         except Exception:
             pass
 
+        memo_section = (
+            f"## 이전 단계에서 확보한 값\n{findings_memo}\n\n"
+            if findings_memo
+            else ""
+        )
         system_prompt = (
             f"당신은 {server_name} MCP 서버의 도구를 사용하여 "
             f"디지털 포렌식 분석을 수행하는 에이전트입니다.\n\n"
             f"## 사용 가능한 도구\n{tool_docs}\n\n"
+            f"{memo_section}"
             f"## 작업 목적\n{purpose}"
         )
         return build_sub_agent_graph(llm, mcp, system_prompt)
@@ -198,11 +208,12 @@ def create_default_registry(
         mcp: MCPClientManager,
         purpose: str,
         extra_context: str,
+        findings_memo: str = "",
     ) -> Any:
         """Dissect 그래프 빌더를 GraphBuilder 시그니처에 맞게 변환"""
         return build_dissect_graph(
             llm, mcp, purpose=purpose, available_plugins=extra_context,
-            light_llm=light_llm,
+            light_llm=light_llm, findings_memo=findings_memo,
         )
 
     registry.register(

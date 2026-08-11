@@ -6,12 +6,14 @@ HITL 게이트는 run_agent.py에서 명시적으로 제어하므로,
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Protocol
 
 import structlog
 from pydantic import ValidationError
 
+from agents.capability import classify_execution_failure
 from agents.factory import AgentRegistry, create_default_registry
 from agents.manager.nodes import (
     _extract_agent_name,
@@ -233,10 +235,70 @@ def _rebuild_recommendations(
     return restored
 
 
+FINDING_PATTERNS: tuple[str, ...] = (
+    r"(?:/(?:c:|sysvol)|[A-Za-z]:)[\\/][^\n,;`\"']{3,120}",
+    r"HK(?:LM|CU|U|CR|CC)\\[^\n,;`\"']{3,120}",
+    r"\b\d{1,3}(?:\.\d{1,3}){3}\b",
+    r"\b[0-9a-fA-F]{12}\b",
+    r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b",
+    r"\b\w+=[^\s,;\n]{2,}",
+)
+"""단계 출력에서 다음 단계에 넘길 값으로 뽑을 패턴 (경로·키·IP·MAC·메일·설정값)"""
+
+MEMO_MAX_ITEMS = 40
+"""공유 메모에 유지할 최대 항목 수"""
+
+
+def extract_findings(step_name: str, output: str, limit: int = 6) -> list[str]:
+    """단계 출력에서 다음 단계가 참조할 핵심 값 추출
+
+    직전 단계 출력 앞 500자를 그대로 넘기는 방식은 정보 밀도가 낮고 병렬
+    실행에서 끊기므로, 식별 가능한 값만 뽑아 누적하는 방식으로 대체
+
+    Args:
+        step_name: 값을 추출한 단계 이름
+        output: 단계 출력 텍스트
+        limit: 단계당 최대 추출 개수
+
+    Returns:
+        "단계명: 값" 형식의 문자열 목록
+    """
+    if not output:
+        return []
+
+    seen: list[str] = []
+    for pattern in FINDING_PATTERNS:
+        for match in re.findall(pattern, output):
+            value = match.split("  ")[0].strip().rstrip(".,;)")
+            if len(value) < 4 or value in seen:
+                continue
+            seen.append(value)
+            if len(seen) >= limit:
+                break
+        if len(seen) >= limit:
+            break
+
+    return [f"{step_name}: {value}" for value in seen]
+
+
+def format_findings_memo(memo: list[str]) -> str:
+    """공유 메모를 프롬프트용 텍스트로 변환
+
+    Args:
+        memo: 누적된 발견값 목록
+
+    Returns:
+        줄바꿈으로 구분된 텍스트
+    """
+    return "\n".join(f"- {item}" for item in memo[-MEMO_MAX_ITEMS:])
+
+
 async def run_planning(
     state: ManagerState,
     llm: BaseLLMProvider,
     mcp: MCPClientManager,
+    mcp_config: MCPConfig | None = None,
+    max_steps: int = 12,
 ) -> ManagerState:
     """계획 수립 단계 실행
 
@@ -247,11 +309,15 @@ async def run_planning(
         state: 전략이 확정된 Manager 상태
         llm: LLM 프로바이더
         mcp: MCP 클라이언트 매니저
+        mcp_config: MCP 설정 (역량 탐색 프로브 선언 포함)
+        max_steps: 계획 단계 수 상한
 
     Returns:
         plan_steps가 채워진 상태
     """
-    updates = await planning_node(state, llm=llm, mcp=mcp)
+    updates = await planning_node(
+        state, llm=llm, mcp=mcp, mcp_config=mcp_config, max_steps=max_steps
+    )
     new_state = {**state, **updates}
     graph = new_state.get("node_graph") or create_initial_graph()
     new_state["node_graph"] = update_planning_done(
@@ -270,12 +336,21 @@ async def run_execution(
     light_llm: BaseLLMProvider | None = None,
     db_engine: Any | None = None,
     cancel_check: Any | None = None,
+    max_parallel: int = 1,
 ) -> ManagerState:
     """Sub-Agent 실행 단계
 
-    plan_steps의 각 단계를 순차적으로 Sub-Agent에 동적 dispatch하고 결과 수집.
+    plan_steps의 각 단계를 Sub-Agent에 동적 dispatch하고 결과 수집.
     AgentRegistry를 통해 MCP 서버명 기반으로 전용/범용 에이전트를 자동 선택.
     실행 완료 후 RAG 서비스가 활성화되어 있으면 결과를 벡터 저장소에 저장.
+
+    `max_parallel`이 1보다 크면 Sub-Agent 호출을 동시 실행한다. 실행 시간의 대부분은
+    LLM 왕복이고 MCP 도구 호출은 동시 요청에 안전하므로 병렬화 이득이 크다.
+    다만 각 단계가 직전 단계 출력을 `context`로 전달받는 연결이 끊기므로,
+    단계 간 의존이 있는 계획에서는 순차 실행이 필요하다.
+
+    결과 집계(노드 그래프 갱신, DFXML 생성, DB 기록, 콜백)는 병렬 모드에서도
+    단계 순서대로 수행해 기존 동작과 산출물 순서를 동일하게 유지한다.
 
     Args:
         state: 계획이 확정된 Manager 상태
@@ -286,6 +361,8 @@ async def run_execution(
         rag_service: RAG 서비스 (None이면 결과 저장 건너뜀)
         light_llm: 요약 등 단순 작업에 사용할 경량 LLM (None이면 메인 LLM 사용)
         db_engine: DB 엔진 (None이면 step 결과 DB 저장 건너뜀)
+        cancel_check: 중단 요청 여부를 반환하는 콜러블
+        max_parallel: 동시 실행할 Sub-Agent 수 (1이면 순차 실행)
 
     Returns:
         task_results가 채워진 상태
@@ -366,20 +443,115 @@ async def run_execution(
                 logger.debug("prefetch_open_skipped", server=server, error=str(exc))
 
     context = ""
+    findings_memo: list[str] = list(state.get("findings_memo") or [])
     i = 0
+
+    async def dispatch_step(
+        step_index: int, step_def: dict[str, Any], shared_context: str
+    ) -> dict[str, Any]:
+        """단일 단계를 Sub-Agent에 dispatch하고 원시 결과 반환
+
+        집계나 상태 변경은 하지 않고 호출만 담당하므로 동시 실행에 안전
+
+        Args:
+            step_index: 단계 인덱스
+            step_def: 계획 단계 정의
+            shared_context: 이전 단계 요약 컨텍스트
+
+        Returns:
+            task, agent/server 이름, 시작 시각, sub_result 또는 error를 담은 dict
+        """
+        agent = _extract_agent_name(step_def)
+        if agent == "manual" and default_server:
+            agent = default_server
+        server = registry.resolve_server(agent)
+
+        dispatch_task: TaskAssignment = {
+            "task_id": str(uuid.uuid4())[:8],
+            "agent_name": agent,
+            "step": step_def,
+            "context": shared_context,
+            "disk_image_path": disk_image_path,
+        }
+
+        purpose_text = step_def.get("purpose", "")
+        hint_text = step_def.get("hints", "")
+        combined = f"{purpose_text}\n힌트: {hint_text}" if hint_text else purpose_text
+
+        started = datetime.now(timezone.utc)
+        payload: dict[str, Any] = {
+            "task": dispatch_task,
+            "agent_name": agent,
+            "server_name": server,
+            "started": started,
+            "sub_result": None,
+            "error": None,
+        }
+        try:
+            memo_text = format_findings_memo(findings_memo)
+            graph_impl = registry.build_graph(
+                server, llm, mcp,
+                purpose=combined,
+                extra_context=prefetch_cache.get(server, ""),
+                findings_memo=memo_text,
+            )
+            payload["sub_result"] = await graph_impl.ainvoke(
+                registry.build_state(server, dispatch_task)
+            )
+        except Exception as exc:
+            logger.error("sub_agent_failed", agent=agent, error=str(exc))
+            payload["error"] = str(exc)
+        return payload
+
+    precomputed: dict[int, dict[str, Any]] = {}
+
+    if max_parallel > 1 and plan_steps:
+        dispatchable = [
+            (idx, sd)
+            for idx, sd in enumerate(plan_steps)
+            if _extract_agent_name(sd) != "manual" or default_server
+        ]
+        for idx, sd in dispatchable:
+            server = registry.resolve_server(_extract_agent_name(sd))
+            if server not in prefetch_cache:
+                prefetch_cache[server] = await registry.prefetch(server, mcp)
+
+        limiter = asyncio.Semaphore(max_parallel)
+
+        async def guarded(idx: int, sd: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            """동시 실행 수를 제한하며 단계를 dispatch
+
+            Args:
+                idx: 단계 인덱스
+                sd: 계획 단계 정의
+
+            Returns:
+                (단계 인덱스, dispatch 결과) 튜플
+            """
+            async with limiter:
+                return idx, await dispatch_step(idx, sd, "")
+
+        logger.info(
+            "parallel_execution_started",
+            steps=len(dispatchable),
+            max_parallel=max_parallel,
+        )
+        gathered = await asyncio.gather(
+            *(guarded(idx, sd) for idx, sd in dispatchable)
+        )
+        precomputed = dict(gathered)
 
     while i < len(plan_steps):
         if cancel_check and cancel_check():
             logger.info("execution_cancelled", step_index=i)
             break
         step = plan_steps[i]
-        if i > 0:
+        if i > 0 and i not in precomputed:
             await asyncio.sleep(EXECUTION_STEP_DELAY)
         agent_name = _extract_agent_name(step)
         if agent_name == "manual" and default_server:
             agent_name = default_server
         purpose = step.get("purpose", "")
-        hints = step.get("hints", "")
 
         server_name = registry.resolve_server(agent_name)
 
@@ -390,8 +562,6 @@ async def run_execution(
             "context": context,
             "disk_image_path": disk_image_path,
         }
-
-        full_purpose = f"{purpose}\n힌트: {hints}" if hints else purpose
 
         if agent_name == "manual":
             result: TaskResult = {
@@ -414,50 +584,56 @@ async def run_execution(
         if callback:
             callback.on_step_start(i, total, step, agent_name)
 
-        if server_name not in prefetch_cache:
-            prefetch_cache[server_name] = await registry.prefetch(server_name, mcp)
+        dispatched = precomputed.pop(i, None)
 
-        logger.info(
-            "sub_agent_dispatch",
-            agent=agent_name,
-            server=server_name,
-            step=step.get("index"),
-        )
+        if dispatched is None:
+            if server_name not in prefetch_cache:
+                prefetch_cache[server_name] = await registry.prefetch(
+                    server_name, mcp
+                )
 
-        sub_graph = registry.build_graph(
-            server_name, llm, mcp,
-            purpose=full_purpose,
-            extra_context=prefetch_cache.get(server_name, ""),
-        )
-        sub_state = registry.build_state(server_name, task)
+            logger.info(
+                "sub_agent_dispatch",
+                agent=agent_name,
+                server=server_name,
+                step=step.get("index"),
+            )
+            dispatched = await dispatch_step(i, step, context)
 
-        step_start_time = datetime.now(timezone.utc)
-        try:
-            sub_result = await sub_graph.ainvoke(sub_state)
-            if sub_result.get("result"):
-                results.append(sub_result["result"])
-                context = sub_result["result"].get("output", "")[:500]
-            else:
-                error_result: TaskResult = {
-                    "task_id": task["task_id"],
-                    "agent_name": agent_name,
-                    "status": "error",
-                    "output": "Sub-Agent가 결과를 반환하지 않았습니다.",
-                    "raw_output_ref": "",
-                    "artifacts": [],
-                }
-                results.append(error_result)
-        except Exception as exc:
-            logger.error("sub_agent_failed", agent=agent_name, error=str(exc))
-            error_result = {
+        task = dispatched["task"]
+        agent_name = dispatched["agent_name"]
+        server_name = dispatched["server_name"]
+        step_start_time = dispatched["started"]
+        sub_result = dispatched["sub_result"]
+
+        if dispatched["error"] is not None:
+            results.append({
                 "task_id": task["task_id"],
                 "agent_name": agent_name,
                 "status": "error",
-                "output": f"Error: {exc}",
+                "output": f"Error: {dispatched['error']}",
                 "raw_output_ref": "",
                 "artifacts": [],
-            }
-            results.append(error_result)
+            })
+        elif sub_result and sub_result.get("result"):
+            results.append(sub_result["result"])
+            step_output = sub_result["result"].get("output", "")
+            context = step_output[:500]
+            if sub_result["result"].get("status") == "success":
+                findings_memo.extend(
+                    extract_findings(
+                        str(step.get("name") or f"step{i + 1}"), step_output
+                    )
+                )
+        else:
+            results.append({
+                "task_id": task["task_id"],
+                "agent_name": agent_name,
+                "status": "error",
+                "output": "Sub-Agent가 결과를 반환하지 않았습니다.",
+                "raw_output_ref": "",
+                "artifacts": [],
+            })
 
         last_result = results[-1]
         graph = update_step_done(
@@ -623,11 +799,31 @@ async def run_execution(
         except Exception as exc:
             logger.warning("rag_store_failed", error=str(exc))
 
+    capability_failures = [
+        {"step_index": idx, "output": (r.get("output") or "")[:200]}
+        for idx, r in enumerate(results)
+        if r.get("status") == "error"
+        and classify_execution_failure(r.get("output") or "")
+    ]
+
     return {
         **state,
         "task_results": results,
         "evidence_repository": evidence_repo,
         "node_graph": graph,
+        "findings_memo": findings_memo,
+        "plan_issues": [
+            *(state.get("plan_issues") or []),
+            *[
+                {
+                    "step_index": f["step_index"],
+                    "kind": "runtime_missing_capability",
+                    "name": "",
+                    "detail": f["output"],
+                }
+                for f in capability_failures
+            ],
+        ],
         "phase": "report",
     }
 
@@ -712,4 +908,6 @@ def create_manager_state(
         discovery_report=None,
         pending_mcp_installs=[],
         installed_mcp_servers=[],
+        findings_memo=[],
+        plan_issues=[],
     )

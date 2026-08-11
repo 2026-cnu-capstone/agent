@@ -31,6 +31,12 @@ DISSECT_SYSTEM_PROMPT = """\
 3. **list_directory는 디렉터리 실재 확인용**: 설치 프로그램 목록처럼 이름을 추측하기 어려운
    대상은 상위 경로를 열거해 실제 이름을 확인한 뒤 접근 (추측한 이름으로 검색하면 놓침)
 
+## 계획에 선언된 수단 우선 (반드시 준수)
+할당된 작업의 힌트에 `도구:` 또는 `기능:`으로 수단이 명시되어 있으면
+**그것을 가장 먼저 시도**하세요. 다른 접근을 먼저 쓰지 마세요.
+명시된 수단이 실패하거나 존재하지 않으면, 대안을 쓰기 전에
+**어떤 수단이 왜 실패했는지 한 줄로 기록**한 뒤 진행하세요.
+
 ## 검색 결과 후속 처리 (반드시 준수)
 **파일 경로 목록은 증거가 아니라 단서입니다.** `search_filesystem`이나 `list_directory`가
 경로를 반환했다면 거기서 멈추지 말고, 관련 있는 파일을 `read_file`로 실제로 열어
@@ -124,6 +130,7 @@ def build_dissect_prompt(
     purpose: str = "",
     available_plugins: str = "",
     tool_docs: str = "",
+    findings_memo: str = "",
 ) -> str:
     """작업 목적과 도구 문서를 포함한 Sub-Agent 시스템 프롬프트 생성
 
@@ -131,6 +138,7 @@ def build_dissect_prompt(
         purpose: 현재 작업의 목적
         available_plugins: 사전 조회된 플러그인 목록
         tool_docs: format_tool_docs()로 생성된 도구 문서
+        findings_memo: 이전 단계들이 확보한 핵심 값 요약
     """
     prompt = DISSECT_SYSTEM_PROMPT.format(
         tool_docs=tool_docs or "(도구 목록은 function calling 스펙을 참조하세요)"
@@ -140,6 +148,11 @@ def build_dissect_prompt(
     if available_plugins:
         parts.append(
             f"## 사용 가능한 플러그인 (사전 조회 완료)\n{available_plugins}"
+        )
+    if findings_memo:
+        parts.append(
+            "## 이전 단계에서 확보한 값 (재조사 불필요, 상호 참조에 활용)\n"
+            f"{findings_memo}"
         )
     if purpose:
         parts.append(f"## 현재 작업 목적\n{purpose}")

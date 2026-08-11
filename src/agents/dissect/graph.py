@@ -7,10 +7,10 @@ DFXML 프래그먼트 생성 finalize_node를 주입
 
 from __future__ import annotations
 
-import structlog
 from functools import partial
 from typing import Any
 
+import structlog
 from langgraph.graph import END, START, StateGraph
 
 from agents.base import (
@@ -20,9 +20,9 @@ from agents.base import (
     sub_agent_llm_node,
 )
 from agents.dissect.nodes import dissect_tool_node
-from prompts.dissect import build_dissect_prompt, format_tool_docs
 from llm_provider.base import BaseLLMProvider
 from mcp_client.client import MCPClientManager
+from prompts.dissect import build_dissect_prompt, format_tool_docs
 from state.sub_agent import SubAgentState
 
 logger = structlog.get_logger()
@@ -108,6 +108,7 @@ def build_dissect_graph(
     purpose: str = "",
     available_plugins: str = "",
     light_llm: BaseLLMProvider | None = None,
+    findings_memo: str = "",
 ) -> Any:
     """Dissect Sub-Agent subgraph 빌드
 
@@ -124,6 +125,7 @@ def build_dissect_graph(
         purpose: 현재 작업 목적 (프롬프트에 주입)
         available_plugins: 사전 조회된 아티팩트 플러그인 목록
         light_llm: 요약 전용 경량 LLM (None이면 llm 사용)
+        findings_memo: 이전 단계들이 확보한 핵심 값 요약
 
     Returns:
         컴파일된 LangGraph subgraph
@@ -140,7 +142,10 @@ def build_dissect_graph(
     except Exception:
         logger.warning("tool_docs_generation_failed")
 
-    system_prompt = build_dissect_prompt(purpose, available_plugins, tool_docs=tool_docs)
+    system_prompt = build_dissect_prompt(
+        purpose, available_plugins, tool_docs=tool_docs,
+        findings_memo=findings_memo,
+    )
 
     graph = StateGraph(SubAgentState)
 
