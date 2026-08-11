@@ -10,9 +10,9 @@ from typing import Any
 import structlog
 from langgraph.graph import END, START, StateGraph
 
+from constants import DEFAULT_MAX_ITERATIONS
 from llm_provider.base import BaseLLMProvider, ToolResult
 from llm_provider.tool_converter import mcp_tools_to_anthropic, mcp_tools_to_openai
-from constants import DEFAULT_MAX_ITERATIONS
 from mcp_client.client import MCPClientManager
 from state.messages import TaskResult as TaskResultType
 from state.sub_agent import SubAgentState
@@ -153,6 +153,9 @@ async def sub_agent_tool_node(
         "pending_tool_calls": [],
         "iteration_count": state["iteration_count"] + 1,
         "output_chunks": state["output_chunks"] + output_chunks,
+        "tool_calls_made": int(state.get("tool_calls_made", 0)) + len(results),
+        "tool_errors": int(state.get("tool_errors", 0))
+        + sum(1 for r in results if r.is_error),
     }
 
 
@@ -197,6 +200,8 @@ async def sub_agent_finalize_node(
     non_blank = [c for c in chunks if c and c.strip()]
     valid_chunks = [c for c in non_blank if not _is_error_chunk(c)]
     error_chunks = [c for c in non_blank if _is_error_chunk(c)]
+    tool_calls_made = int(state.get("tool_calls_made", 0))
+    tool_errors = int(state.get("tool_errors", 0))
 
     if last_content:
         output = last_content
@@ -209,17 +214,23 @@ async def sub_agent_finalize_node(
 
     if not output.strip():
         has_error = True
-        output = (
-            "단계가 산출물을 만들지 못했습니다. "
-            f"(도구 호출 {len(chunks)}건, 오류 응답 {len(error_chunks)}건, "
-            "LLM 최종 응답 없음)"
-        )
+        if tool_calls_made == 0:
+            reason = "LLM이 도구를 한 번도 호출하지 않고 빈 응답을 반환"
+        elif tool_errors >= tool_calls_made:
+            reason = f"도구 호출 {tool_calls_made}건이 모두 실패"
+        else:
+            reason = (
+                f"도구 호출 {tool_calls_made}건 중 {tool_errors}건 실패, "
+                "LLM 최종 응답 없음"
+            )
+        output = f"단계가 산출물을 만들지 못했습니다. ({reason})"
         logger.warning(
             "sub_agent_empty_output",
             task_id=task["task_id"],
             agent=task["agent_name"],
-            chunks=len(chunks),
-            error_chunks=len(error_chunks),
+            tool_calls_made=tool_calls_made,
+            tool_errors=tool_errors,
+            reason=reason,
         )
 
     result: TaskResultType = {
@@ -329,6 +340,8 @@ def create_sub_agent_state(
         tools=tools or {},
         pending_tool_calls=[],
         iteration_count=0,
+        tool_calls_made=0,
+        tool_errors=0,
         max_iterations=max_iterations,
         output_chunks=[],
         result=None,

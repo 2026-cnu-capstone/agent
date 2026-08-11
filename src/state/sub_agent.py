@@ -32,6 +32,12 @@ class SubAgentState(TypedDict):
     iteration_count: int
     """현재 ReAct 루프 반복 횟수"""
 
+    tool_calls_made: int
+    """지금까지 실행한 도구 호출 총 건수 (실패 포함)"""
+
+    tool_errors: int
+    """실패로 반환된 도구 호출 건수"""
+
     max_iterations: int
     """최대 허용 반복 횟수"""
 
