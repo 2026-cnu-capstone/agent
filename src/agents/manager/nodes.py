@@ -10,6 +10,7 @@ from typing import Any
 
 import structlog
 
+from agents.capability import collect_capabilities, validate_plan
 from config import DiscoveryConfig, MCPConfig
 from discovery.catalog import TOOL_INDEX
 from discovery.proposal import build_proposals
@@ -77,11 +78,75 @@ async def strategy_node(
     }
 
 
+MODEL_TIER_STRONG: tuple[str, ...] = ("opus", "sonnet")
+"""단계를 줄이고 자율성을 높이는 편이 나은 모델 등급 표식"""
+
+
+def _model_tier(model: str) -> str:
+    """모델명에서 등급 판별
+
+    Args:
+        model: LLM 모델 식별자
+
+    Returns:
+        strong 또는 빈 문자열
+    """
+    lowered = model.lower()
+    return "strong" if any(m in lowered for m in MODEL_TIER_STRONG) else ""
+
+
+def _probe_args_from_profile(system_profile: str) -> dict[str, Any]:
+    """시스템 프로필에서 탐색 도구 호출에 필요한 식별자 추출
+
+    dissect의 `list_plugins`처럼 열린 타겟 식별자를 요구하는 탐색 도구가 있어,
+    프로필 JSON의 `*_id` 필드를 그대로 인자로 전달
+
+    Args:
+        system_profile: open_target 등이 반환한 프로필 텍스트
+
+    Returns:
+        탐색 도구 호출 인자 (추출 실패 시 빈 dict)
+    """
+    if not system_profile.strip():
+        return {}
+    try:
+        data = json.loads(system_profile)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: value
+        for key, value in data.items()
+        if key.endswith("_id") and isinstance(value, str) and value
+    }
+
+
+def _format_capability_docs(capabilities: Any) -> str:
+    """역량 집합을 계획 프롬프트용 텍스트로 변환
+
+    Args:
+        capabilities: collect_capabilities 결과
+
+    Returns:
+        도구 및 기능 목록 텍스트
+    """
+    lines: list[str] = []
+    if capabilities.bare_tool_names:
+        lines.append("도구: " + ", ".join(sorted(capabilities.bare_tool_names)))
+    if capabilities.probed_names:
+        names = sorted(capabilities.probed_names)[:120]
+        lines.append("기능: " + ", ".join(names))
+    return "\n".join(lines)
+
+
 async def planning_node(
     state: ManagerState,
     *,
     llm: BaseLLMProvider,
     mcp: MCPClientManager,
+    mcp_config: MCPConfig | None = None,
+    max_steps: int = 12,
 ) -> dict[str, Any]:
     """수립된 전략을 바탕으로 세부 실행 계획 수립
 
@@ -95,6 +160,13 @@ async def planning_node(
     """
     server_names = mcp.connected_servers
     server_list = "\n".join(f"- {name}" for name in server_names) if server_names else ""
+
+    capabilities = await collect_capabilities(
+        mcp,
+        (mcp_config.capability_probes if mcp_config else None),
+        _probe_args_from_profile(state.get("system_profile") or ""),
+    )
+    capability_docs = _format_capability_docs(capabilities)
 
     rag_context = state.get("rag_context", "")
 
@@ -121,16 +193,40 @@ async def planning_node(
             server_list,
             rag_context=rag_context,
             system_profile=state.get("system_profile") or "",
+            capability_docs=capability_docs,
+            max_steps=max_steps,
+            model_tier=_model_tier(getattr(llm, "_config", None) and getattr(llm._config, "model", "") or ""),
         ),
     )
     plan_text = response.content if isinstance(response.content, str) else ""
     plan_steps = _parse_plan_steps(plan_text)
-    logger.info("plan_created", length=len(plan_text), steps=len(plan_steps))
+    if len(plan_steps) > max_steps:
+        logger.info(
+            "plan_truncated", generated=len(plan_steps), kept=max_steps
+        )
+        plan_steps = plan_steps[:max_steps]
+
+    issues = validate_plan(plan_steps, capabilities)
+    logger.info(
+        "plan_created",
+        length=len(plan_text),
+        steps=len(plan_steps),
+        capability_issues=len(issues),
+    )
 
     return {
         "messages": [{"role": "assistant", "content": response.content}],
         "analysis_plan": plan_text,
         "plan_steps": plan_steps,
+        "plan_issues": [
+            {
+                "step_index": i.step_index,
+                "kind": i.kind,
+                "name": i.name,
+                "detail": i.detail,
+            }
+            for i in issues
+        ],
         "phase": "execution",
     }
 

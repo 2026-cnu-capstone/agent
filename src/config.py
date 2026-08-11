@@ -55,6 +55,14 @@ class MCPConfig(BaseModel):
         default_factory=dict,
         description="에이전트별 MCP 서버 매핑. 미설정 시 서버명 == 에이전트명 자동 매핑",
     )
+    capability_probes: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "서버별 하위 기능 탐색 도구 선언. "
+            '{"dissect": {"tool": "list_plugins"}} 형식. '
+            "미선언 시 이름 규약으로 추정하며, 추정도 실패하면 검증을 건너뜀"
+        ),
+    )
 
 
 class LLMProvider(str, Enum):
@@ -235,7 +243,12 @@ def _load_mcp_from_json(path: Path) -> MCPConfig:
             )
 
     agent_mapping = raw.get("agentMapping", {})
-    return MCPConfig(servers=servers, agent_mapping=agent_mapping)
+    capability_probes = raw.get("capabilityProbes", {})
+    return MCPConfig(
+        servers=servers,
+        agent_mapping=agent_mapping,
+        capability_probes=capability_probes,
+    )
 
 
 def load_settings(config_path: Path | None = None) -> Settings:

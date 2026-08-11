@@ -119,6 +119,14 @@ FILESYSTEM_SEARCH_RULES = r"""[파일시스템 검색 규칙]
 - 레지스트리/실행 흔적은 query_plugin이 더 정확합니다. 파일 검색은 보조 수단으로 쓰세요."""
 
 
+STRONG_MODEL_GUIDANCE = """
+[단계 설계 지침 — 고성능 모델]
+단계를 잘게 쪼개지 말고 관련 아티팩트를 묶어 하나의 단계로 구성하세요.
+각 단계의 purpose를 넓게 잡고 Sub-Agent가 내부에서 여러 도구를 조합해
+판단하도록 맡기는 편이 결과가 낫습니다.
+"""
+
+
 def build_path_conventions(system_profile: str) -> str:
     """시스템 프로필에서 대상 OS에 맞는 경로 규칙 문자열 생성
 
@@ -154,6 +162,9 @@ def build_planning_prompt(
     mcp_servers: str = "",
     rag_context: str = "",
     system_profile: str = "",
+    capability_docs: str = "",
+    max_steps: int = 12,
+    model_tier: str = "",
 ) -> str:
     """수립된 전략을 바탕으로 세부 실행 계획 수립 프롬프트
 
@@ -165,6 +176,9 @@ def build_planning_prompt(
         mcp_servers: 사용 가능한 MCP 서버 목록 문자열
         rag_context: RAG로 검색된 유사 사례 실행 계획 텍스트
         system_profile: 대상 이미지의 시스템 프로필 (OS별 경로 규칙 주입용)
+        capability_docs: 환경이 실제 제공하는 도구/기능 목록
+        max_steps: 계획 단계 수 상한
+        model_tier: 모델 등급 (strong이면 단계를 줄이고 자율성을 높임)
     """
     rag_section = ""
     if rag_context:
@@ -177,6 +191,14 @@ def build_planning_prompt(
     if path_section:
         path_section = f"\n{path_section}\n\n{FILESYSTEM_SEARCH_RULES}\n"
 
+    capability_section = ""
+    if capability_docs:
+        capability_section = (
+            f"\n[사용 가능한 도구 및 기능 — 이 목록에서만 선택]\n{capability_docs}\n"
+        )
+
+    tier_section = STRONG_MODEL_GUIDANCE if model_tier == "strong" else ""
+
     return f"""당신은 디지털 포렌식 분석 전문가 AI입니다.
 
 아래 조사 대상 아티팩트 목록을 바탕으로 단계별 실행 계획을 작성하세요.
@@ -188,16 +210,21 @@ def build_planning_prompt(
 
 [사용 가능한 MCP 서버]
 {mcp_servers if mcp_servers else "(연결된 서버 없음)"}
-{path_section}{rag_section}
+{capability_section}{path_section}{tier_section}{rag_section}
 ---
 
 **가장 먼저** 아래 JSON을 코드 블록으로 출력하세요. (상세 설명보다 반드시 앞에 위치)
 위 계획의 모든 단계를 steps 배열에 빠짐없이 포함해야 합니다.
 MCP 서버가 필요 없는 단계는 mcp_server에 "none"을 넣으세요.
 
-**hints 필드에는 반드시 사용할 dissect 플러그인명을 포함하세요.**
-Sub-Agent는 hints에 명시된 플러그인을 query_plugin으로 우선 호출합니다.
-예: "플러그인: sam, userassist / 레지스트리 키: HKLM\\SAM"
+**hints에는 사용할 수단을 아래 사용 가능한 도구/기능 목록에서만 골라 명시하세요.**
+목록에 없는 이름을 적으면 실행 단계에서 실패합니다.
+Sub-Agent는 hints에 명시된 수단을 우선 호출합니다.
+예: "도구: query_plugin / 기능: sam, userassist / 레지스트리 키: HKLM\\SAM"
+
+**단계 수는 {max_steps}개를 넘기지 마세요.** 계획이 클수록 이행률이 떨어집니다.
+조사 항목이 많으면 쪼개지 말고 사건 입증에 직접 기여하는 것부터 우선순위를 매겨
+{max_steps}개 안에 담으세요.
 
 ```json
 {{
