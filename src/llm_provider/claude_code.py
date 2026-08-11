@@ -415,40 +415,112 @@ def _parse_cli_payload(
             usage=usage,
         )
 
+    stop_reason = str(payload.get("stop_reason") or "end_turn")
     protocol = _extract_json_object(text)
-    if protocol is None:
-        logger.warning("claude_code_protocol_parse_failed", preview=text[:200])
+
+    tool_calls = _extract_tool_calls(protocol) if protocol else []
+    answer = ""
+    if protocol:
+        for key in ("text", "content", "answer", "message"):
+            value = protocol.get(key)
+            if isinstance(value, str) and value.strip():
+                answer = value
+                break
+
+    if tool_calls:
         return LLMResponse(
-            content=text,
-            stop_reason=str(payload.get("stop_reason") or "end_turn"),
+            content=answer,
+            tool_calls=tool_calls,
+            stop_reason="tool_use",
             usage=usage,
         )
 
-    calls = protocol.get("calls") or protocol.get("tool_calls") or []
-    tool_calls: list[ToolCall] = []
-    if isinstance(calls, list):
-        for index, call in enumerate(calls):
-            if not isinstance(call, dict):
-                continue
-            name = call.get("name")
-            if not isinstance(name, str) or not name:
-                continue
-            arguments = call.get("arguments")
-            tool_calls.append(
-                ToolCall(
-                    id=f"cc_{index}_{uuid.uuid4().hex[:8]}",
-                    name=name,
-                    arguments=arguments if isinstance(arguments, dict) else {},
-                )
-            )
+    if answer:
+        return LLMResponse(content=answer, stop_reason=stop_reason, usage=usage)
 
-    answer = protocol.get("text") or protocol.get("content") or ""
-    return LLMResponse(
-        content=str(answer) if not tool_calls else str(answer or ""),
-        tool_calls=tool_calls,
-        stop_reason="tool_use" if tool_calls else "end_turn",
-        usage=usage,
+    logger.warning(
+        "claude_code_protocol_unmatched",
+        had_json=protocol is not None,
+        keys=sorted(protocol)[:8] if protocol else [],
+        preview=text[:400],
     )
+    return LLMResponse(content=text, stop_reason=stop_reason, usage=usage)
+
+
+CALL_LIST_KEYS = ("calls", "tool_calls", "tools", "actions")
+CALL_NAME_KEYS = ("name", "tool", "tool_name", "function")
+CALL_ARG_KEYS = ("arguments", "args", "input", "parameters", "params")
+
+
+def _extract_tool_calls(protocol: dict[str, Any]) -> list[ToolCall]:
+    """규약 객체에서 도구 호출 목록 추출
+
+    모델이 키 이름을 바꿔 쓰거나(`tool`, `args`) 배열 없이 단일 호출을 그대로
+    출력하는 경우가 있어 여러 변형을 허용. 형식이 조금 달라도 호출을 살려내지
+    못하면 단계 전체가 산출물 없이 끝나므로 관용적으로 파싱
+
+    Args:
+        protocol: 응답에서 추출한 JSON 객체
+
+    Returns:
+        파싱된 도구 호출 목록 (없으면 빈 리스트)
+    """
+    raw_calls: list[Any] = []
+    for key in CALL_LIST_KEYS:
+        value = protocol.get(key)
+        if isinstance(value, list):
+            raw_calls = value
+            break
+        if isinstance(value, dict):
+            raw_calls = [value]
+            break
+
+    if not raw_calls and any(k in protocol for k in CALL_NAME_KEYS):
+        raw_calls = [protocol]
+
+    tool_calls: list[ToolCall] = []
+    for index, call in enumerate(raw_calls):
+        if not isinstance(call, dict):
+            continue
+
+        name = None
+        for key in CALL_NAME_KEYS:
+            value = call.get(key)
+            if isinstance(value, str) and value.strip():
+                name = value.strip()
+                break
+            if isinstance(value, dict):
+                nested = value.get("name")
+                if isinstance(nested, str) and nested.strip():
+                    name = nested.strip()
+                    break
+        if not name:
+            continue
+
+        arguments: dict[str, Any] = {}
+        for key in CALL_ARG_KEYS:
+            value = call.get(key)
+            if isinstance(value, dict):
+                arguments = value
+                break
+            if isinstance(value, str) and value.strip():
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    arguments = parsed
+                    break
+
+        tool_calls.append(
+            ToolCall(
+                id=f"cc_{index}_{uuid.uuid4().hex[:8]}",
+                name=name,
+                arguments=arguments,
+            )
+        )
+
+    return tool_calls
 
 
 def _parse_usage(raw: Any) -> dict[str, int]:
