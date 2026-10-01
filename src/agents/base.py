@@ -122,7 +122,7 @@ async def sub_agent_tool_node(
         try:
             call_result = await mcp.call_tool(tc["name"], tc.get("arguments"))
             content = mcp.get_tool_result_text(call_result)
-            is_error = bool(call_result.isError)
+            is_error = bool(call_result.isError) or _is_error_payload(content)
         except Exception as exc:
             logger.error("sub_agent_tool_failed", tool=tc["name"], error=str(exc))
             content = f"Error: {exc}"
@@ -157,6 +157,25 @@ async def sub_agent_tool_node(
         "tool_errors": int(state.get("tool_errors", 0))
         + sum(1 for r in results if r.is_error),
     }
+
+
+def _is_error_payload(content: str) -> bool:
+    """도구 응답이 JSON 에러 객체인지 판별
+
+    dissect MCP 등은 실패를 isError=false로 감싼 {"error": ...} JSON으로
+    반환하므로, 이를 실패로 세지 않으면 대상에 닿지 못한 단계가 성공으로 기록됨
+
+    Args:
+        content: 도구 응답 텍스트
+
+    Returns:
+        최상위에 error 키를 가진 JSON 객체이면 True
+    """
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(data, dict) and bool(data.get("error"))
 
 
 def _is_error_chunk(chunk: str) -> bool:

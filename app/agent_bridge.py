@@ -763,10 +763,28 @@ async def approve_plan(case_id: str, approved: bool, feedback: str = "") -> dict
 
 
 async def execute_analysis(case_id: str) -> dict[str, Any]:
-    """승인된 계획 실행"""
+    """승인된 계획 실행
+
+    외장 드라이브 분리 등으로 이미지가 사라진 상태에서 모든 단계가 헛도는 것을
+    막기 위해 실행 전에 디스크 이미지 존재 여부를 확인
+
+    Args:
+        case_id: 분석 케이스 ID
+
+    Returns:
+        task_results와 node_graph가 담긴 실행 결과
+
+    Raises:
+        ValueError: 분석 세션이 없을 때
+        FileNotFoundError: 디스크 이미지에 접근할 수 없을 때
+    """
     state = _analysis_states.get(case_id)
     if not state:
         raise ValueError(f"분석 세션 없음: {case_id}")
+
+    image_path = state.get("disk_image_path")
+    if image_path and not Path(image_path).exists():
+        raise FileNotFoundError(f"디스크 이미지에 접근할 수 없습니다: {image_path}")
 
     clear_cancel(case_id)
     llm = await get_llm(_api_choice)
