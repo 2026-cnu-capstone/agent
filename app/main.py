@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.agent_bridge import shutdown_mcp
 from app.routers import cases
 from app.routers.analysis import router as analysis_router
+from app.routers.mcp_servers import router as mcp_servers_router
 
 
 @asynccontextmanager
@@ -29,3 +30,4 @@ app.add_middleware(
 
 app.include_router(cases.router, prefix="/api")
 app.include_router(analysis_router)
+app.include_router(mcp_servers_router)
