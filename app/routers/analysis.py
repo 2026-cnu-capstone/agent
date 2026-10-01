@@ -27,16 +27,31 @@ from app.ws_manager import manager as ws_manager
 router = APIRouter(prefix="/api/analysis", tags=["analysis"])
 
 
-async def _mark_case_failed(case_id: str) -> None:
+async def _set_case_status(case_id: str, status: str) -> None:
+    """케이스 상태 기록 (DB 미사용·실패 시 무시)
+
+    Args:
+        case_id: 분석 케이스 ID
+        status: 기록할 cases.status 값
+    """
     try:
         from database.engine import get_session
         from database.repository import update_case_status
         engine = await get_db_engine()
         if engine:
             async with get_session(engine) as session:
-                await update_case_status(session, case_id, "failed")
+                await update_case_status(session, case_id, status)
     except Exception:
         pass
+
+
+async def _mark_case_failed(case_id: str) -> None:
+    """케이스 상태를 failed로 기록
+
+    Args:
+        case_id: 분석 케이스 ID
+    """
+    await _set_case_status(case_id, "failed")
 
 
 @router.post("/start")
@@ -108,12 +123,17 @@ async def api_approve_plan(case_id: str, req: PlanApproval):
 
 @router.post("/{case_id}/execute")
 async def api_execute_analysis(case_id: str):
-    """승인된 계획 실행 (WebSocket으로 진행상황 push)"""
+    """승인된 계획 실행 (WebSocket으로 진행상황 push)
+
+    완료 시 cases.status를 executed로 기록해 리포트 생성 전 재진입해도
+    완료 상태로 복원되게 함
+    """
     try:
         result = await execute_analysis(case_id)
         event_data = {"task_results": result["task_results"]}
         if result.get("node_graph"):
             event_data["node_graph"] = result["node_graph"]
+        await _set_case_status(case_id, "executed")
         await ws_manager.send_event(case_id, "execution_done", event_data)
         return {"status": "done", "total_steps": len(result["task_results"])}
     except ValueError as e:

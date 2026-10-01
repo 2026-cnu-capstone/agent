@@ -22,7 +22,7 @@ class Case(BaseModel):
     name: str
     description: str
     created_at: str
-    status: Literal["open", "closed", "running", "done", "failed"]
+    status: Literal["open", "closed", "running", "executed", "done", "failed"]
 
 
 class AnalysisRequest(BaseModel):

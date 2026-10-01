@@ -183,7 +183,14 @@ async def reconnect_mcp() -> MCPClientManager:
 
 
 async def get_db_engine():
-    """DB 엔진 반환 (database_url 없으면 None)"""
+    """DB 엔진 반환
+
+    인증 실패·네트워크 단절로 초기화에 실패하면 None을 돌려줘
+    호출부가 인메모리 fallback으로 계속 동작하게 함
+
+    Returns:
+        초기화된 AsyncEngine, database_url이 없거나 연결 실패 시 None
+    """
     global _db_engine
     if _db_engine is not None:
         return _db_engine
@@ -193,7 +200,12 @@ async def get_db_engine():
         return None
 
     engine = get_engine(settings.database_url)
-    await init_db(engine)
+    try:
+        await init_db(engine)
+    except Exception:
+        import logging
+        logging.getLogger("agent_bridge").warning("db_unavailable", exc_info=True)
+        return None
     _db_engine = engine
     ws_manager.set_engine(engine)
     return engine
