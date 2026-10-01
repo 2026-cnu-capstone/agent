@@ -504,6 +504,7 @@ async def run_execution(
         return payload
 
     precomputed: dict[int, dict[str, Any]] = {}
+    live_started: set[int] = set()
 
     if max_parallel > 1 and plan_steps:
         dispatchable = [
@@ -521,6 +522,9 @@ async def run_execution(
         async def guarded(idx: int, sd: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             """동시 실행 수를 제한하며 단계를 dispatch
 
+            집계 루프는 gather 이후에 돌기 때문에, 시작·완료 상태를 여기서 바로
+            그래프와 콜백에 반영해야 실행 중 진행 상황이 실시간으로 보임
+
             Args:
                 idx: 단계 인덱스
                 sd: 계획 단계 정의
@@ -528,8 +532,29 @@ async def run_execution(
             Returns:
                 (단계 인덱스, dispatch 결과) 튜플
             """
+            nonlocal graph
             async with limiter:
-                return idx, await dispatch_step(idx, sd, "")
+                live_agent = _extract_agent_name(sd)
+                if live_agent == "manual" and default_server:
+                    live_agent = default_server
+                graph = update_step_started(graph, idx)
+                live_started.add(idx)
+                if callback:
+                    callback.on_step_start(idx, total, sd, live_agent)
+                payload = await dispatch_step(idx, sd, "")
+                live_result = (payload.get("sub_result") or {}).get("result") or {}
+                live_status = live_result.get("status") or "error"
+                graph = update_step_done(
+                    graph, idx, live_status,
+                    output_summary=live_result.get("output") or payload.get("error") or "",
+                )
+                if callback:
+                    callback.on_step_done(idx, total, sd, live_agent, {
+                        "status": live_status,
+                        "output": live_result.get("output")
+                        or f"Error: {payload.get('error') or 'Sub-Agent가 결과를 반환하지 않았습니다.'}",
+                    })
+                return idx, payload
 
         logger.info(
             "parallel_execution_started",
@@ -580,9 +605,10 @@ async def run_execution(
             i += 1
             continue
 
-        graph = update_step_started(graph, i)
-        if callback:
-            callback.on_step_start(i, total, step, agent_name)
+        if i not in live_started:
+            graph = update_step_started(graph, i)
+            if callback:
+                callback.on_step_start(i, total, step, agent_name)
 
         dispatched = precomputed.pop(i, None)
 

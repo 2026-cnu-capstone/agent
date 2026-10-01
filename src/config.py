@@ -147,6 +147,7 @@ class Settings(BaseSettings):
         MINDLOGIC_BASE_URL     → mindlogic_base_url
         MINDLOGIC_MODEL        → mindlogic_model
         DATABASE_URL           → database_url
+        EXECUTION_MAX_PARALLEL → execution_max_parallel
         DISCOVERY_SEARCH_ROOTS → discovery.search_roots (load_settings에서 처리)
     """
 
@@ -186,6 +187,9 @@ class Settings(BaseSettings):
     mindlogic_model: str = "claude-sonnet-4-6"
 
     database_url: str = ""
+
+    execution_max_parallel: int = Field(default=4, ge=1)
+    """웹 실행 경로의 Sub-Agent 동시 실행 수 (1이면 순차 실행)"""
 
     discovery_search_roots: str = ""
     """MCP 서버 탐색 루트 (PATH처럼 `:` 구분, 예: ~/Documents/3-Project)"""

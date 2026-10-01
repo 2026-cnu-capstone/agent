@@ -794,6 +794,7 @@ async def execute_analysis(case_id: str) -> dict[str, Any]:
     callback = WebSocketExecutionCallback(case_id)
 
     light_llm = await get_light_llm()
+    settings = await get_settings()
     state = await run_execution(
         state, llm, mcp,
         callback=callback,
@@ -801,6 +802,7 @@ async def execute_analysis(case_id: str) -> dict[str, Any]:
         light_llm=light_llm,
         db_engine=db_engine,
         cancel_check=lambda: is_cancelled(case_id),
+        max_parallel=settings.execution_max_parallel,
     )
     _analysis_states[case_id] = state
     clear_cancel(case_id)

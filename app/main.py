@@ -10,6 +10,7 @@ from app.routers import cases
 from app.routers.analysis import router as analysis_router
 from app.routers.evidence import router as evidence_router
 from app.routers.mcp_servers import router as mcp_servers_router
+from app.routers.settings import router as settings_router
 
 
 @asynccontextmanager
@@ -31,5 +32,6 @@ app.add_middleware(
 
 app.include_router(cases.router, prefix="/api")
 app.include_router(analysis_router)
+app.include_router(settings_router)
 app.include_router(mcp_servers_router)
 app.include_router(evidence_router)
