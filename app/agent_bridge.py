@@ -80,6 +80,29 @@ def set_api_choice(choice: str) -> None:
     _llm_cache.pop(choice, None)
 
 
+def _resolve_api_choice(settings) -> str:
+    """현재 선택값의 실제 프로바이더 ID 해석
+
+    "default"는 .env의 LLM 설정에 따라 claude_code/mindlogic/openai/anthropic 중
+    하나로 결정됨
+
+    Args:
+        settings: 로드된 Settings 인스턴스
+
+    Returns:
+        실제 사용되는 프로바이더 ID
+    """
+    if _api_choice != "default":
+        return _api_choice
+    if settings.llm.provider == LLMProvider.CLAUDE_CODE:
+        return "claude_code"
+    if settings.llm.provider == LLMProvider.OPENAI and settings.llm.base_url:
+        return "mindlogic" if settings.mindlogic_api_key else "openai"
+    if settings.llm.provider == LLMProvider.OPENAI:
+        return "openai"
+    return "anthropic"
+
+
 async def get_llm_options() -> dict[str, Any]:
     """사용 가능한 LLM 옵션 목록 반환"""
     settings = await get_settings()
@@ -113,16 +136,7 @@ async def get_llm_options() -> dict[str, Any]:
         "note": "API 키 대신 로컬 Claude Code 구독 인증 사용",
     })
 
-    current = _api_choice
-    if current == "default":
-        if settings.llm.provider == LLMProvider.CLAUDE_CODE:
-            current = "claude_code"
-        elif settings.llm.provider == LLMProvider.OPENAI and settings.llm.base_url:
-            current = "mindlogic" if settings.mindlogic_api_key else "openai"
-        elif settings.llm.provider == LLMProvider.OPENAI:
-            current = "openai"
-        else:
-            current = "anthropic"
+    current = _resolve_api_choice(settings)
 
     light_available = bool(settings.anthropic_api_key)
     return {
@@ -275,7 +289,8 @@ async def get_light_llm() -> BaseLLMProvider | None:
     """경량 LLM 프로바이더 반환 (요약, DFXML 변환 등 단순 작업용)
 
     Claude Code 헤드리스 모드가 선택된 경우 API 키 없이도 경량 프로바이더를
-    제공하므로 요약/DFXML 변환 경로가 비활성화되지 않음
+    제공하므로 요약/DFXML 변환 경로가 비활성화되지 않음. Mindlogic 선택 시에는
+    경량 모델도 같은 게이트웨이로 호출해 Anthropic 키 크레딧과 무관하게 동작
     """
     if "light" in _llm_cache:
         return _llm_cache["light"]
@@ -293,6 +308,18 @@ async def get_light_llm() -> BaseLLMProvider | None:
             max_tokens=settings.light_llm.max_tokens,
         )
         llm: BaseLLMProvider = ClaudeCodeProvider(light_config, settings.claude_code)
+        _llm_cache["light"] = llm
+        return llm
+
+    if _resolve_api_choice(settings) == "mindlogic" and settings.mindlogic_api_key:
+        from config import LLMConfig
+        light_config = LLMConfig(
+            provider=LLMProvider.OPENAI,
+            model=settings.light_llm.model,
+            base_url=settings.mindlogic_base_url,
+            max_tokens=settings.light_llm.max_tokens,
+        )
+        llm = OpenAIProvider(light_config, api_key=settings.mindlogic_api_key)
         _llm_cache["light"] = llm
         return llm
 
