@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -42,6 +42,12 @@ class Case(Base):
     )
     embeddings: Mapped[list["CaseEmbedding"]] = relationship(back_populates="case")
     reports: Mapped[list["Report"]] = relationship(
+        back_populates="case", cascade="all, delete-orphan"
+    )
+    workflow_nodes: Mapped[list["WorkflowNode"]] = relationship(
+        back_populates="case", cascade="all, delete-orphan"
+    )
+    workflow_edges: Mapped[list["WorkflowEdge"]] = relationship(
         back_populates="case", cascade="all, delete-orphan"
     )
 
@@ -241,3 +247,46 @@ class AnalysisEvent(Base):
             "payload": self.payload,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class WorkflowNode(Base):
+    """React Flow 캔버스 노드 위치 및 상태"""
+
+    __tablename__ = "workflow_nodes"
+    __table_args__ = (UniqueConstraint("case_id", "node_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    case_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("cases.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    node_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    node_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    x: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    y: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    case: Mapped["Case"] = relationship(back_populates="workflow_nodes")
+
+
+class WorkflowEdge(Base):
+    """React Flow 캔버스 엣지"""
+
+    __tablename__ = "workflow_edges"
+    __table_args__ = (UniqueConstraint("case_id", "edge_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    case_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("cases.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    edge_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_node: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_node: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    case: Mapped["Case"] = relationship(back_populates="workflow_edges")

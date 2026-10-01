@@ -151,9 +151,14 @@ CREATE TRIGGER reports_updated_at
 CREATE TABLE IF NOT EXISTS workflow_nodes (
   id          SERIAL       PRIMARY KEY,
   case_id     VARCHAR(36)  NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
-  x           DOUBLE PRECISION NOT NULL,
-  y           DOUBLE PRECISION NOT NULL,
-  updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+  node_id     VARCHAR(64)  NOT NULL,
+  label       VARCHAR(255),
+  node_type   VARCHAR(20),
+  status      VARCHAR(20),
+  x           DOUBLE PRECISION NOT NULL DEFAULT 0,
+  y           DOUBLE PRECISION NOT NULL DEFAULT 0,
+  updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  UNIQUE(case_id, node_id)
 );
 
 CREATE INDEX ON workflow_nodes(case_id);

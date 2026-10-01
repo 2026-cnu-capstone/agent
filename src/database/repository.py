@@ -17,6 +17,8 @@ from database.models import (
     PlanStep,
     Report,
     TaskResult,
+    WorkflowEdge,
+    WorkflowNode,
 )
 
 
@@ -99,6 +101,35 @@ async def create_analysis_session(
         plan_text=plan_text,
     )
     session.add(analysis_session)
+    await session.commit()
+    await session.refresh(analysis_session)
+    return analysis_session
+
+
+async def update_analysis_session(
+    session: AsyncSession,
+    session_id: int,
+    phase: str | None = None,
+    result_summary: str | None = None,
+) -> AnalysisSession | None:
+    """분석 세션 상태 업데이트
+
+    Args:
+        session: DB 세션
+        session_id: 분석 세션 ID
+        phase: 변경할 phase (None이면 유지)
+        result_summary: 결과 요약 (None이면 유지)
+
+    Returns:
+        업데이트된 AnalysisSession 또는 None
+    """
+    analysis_session = await session.get(AnalysisSession, session_id)
+    if analysis_session is None:
+        return None
+    if phase is not None:
+        analysis_session.phase = phase
+    if result_summary is not None:
+        analysis_session.result_summary = result_summary
     await session.commit()
     await session.refresh(analysis_session)
     return analysis_session
@@ -281,3 +312,57 @@ async def get_events_by_type(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def save_workflow_graph(
+    session: AsyncSession,
+    case_id: str,
+    graph: dict[str, Any],
+) -> None:
+    """노드 그래프를 workflow_nodes/workflow_edges에 upsert
+
+    Args:
+        session: DB 세션
+        case_id: 케이스 ID
+        graph: node_graph 딕셔너리 (nodes, edges)
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    for node in graph.get("nodes", []):
+        stmt = pg_insert(WorkflowNode).values(
+            case_id=case_id,
+            node_id=node["id"],
+            label=node.get("label", ""),
+            node_type=node.get("type", ""),
+            status=node.get("status", "pending"),
+            x=float(node.get("col", 0)),
+            y=float(node.get("row", 0)),
+        ).on_conflict_do_update(
+            index_elements=["case_id", "node_id"],
+            set_={
+                "label": node.get("label", ""),
+                "node_type": node.get("type", ""),
+                "status": node.get("status", "pending"),
+                "x": float(node.get("col", 0)),
+                "y": float(node.get("row", 0)),
+            },
+        )
+        await session.execute(stmt)
+
+    for edge in graph.get("edges", []):
+        edge_id = f"{edge['from_node']}->{edge['to_node']}"
+        stmt = pg_insert(WorkflowEdge).values(
+            case_id=case_id,
+            edge_id=edge_id,
+            source_node=edge["from_node"],
+            target_node=edge["to_node"],
+        ).on_conflict_do_update(
+            index_elements=["case_id", "edge_id"],
+            set_={
+                "source_node": edge["from_node"],
+                "target_node": edge["to_node"],
+            },
+        )
+        await session.execute(stmt)
+
+    await session.commit()
